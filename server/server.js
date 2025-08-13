@@ -4,177 +4,109 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 const GameEngine = require('./game/gameEngine');
 const RoomManager = require('./game/roomManager');
 
-// Initialize Express and HTTP server
+// Initialize app
 const app = express();
 const server = http.createServer(app);
 
-// Environment variables
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mgt-tooza.onrender.com';
-const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI;
-
-// Secure CORS configuration
+// Middleware
 app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: process.env.FRONTEND_URL,
+  credentials: true
 }));
+app.use(express.json());
+app.use(cookieParser());
 
-// Additional security headers
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('X-Content-Type-Options', 'nosniff');
-  next();
+// Database connection
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// JWT Authentication Middleware
+function authenticateToken(req, res, next) {
+  const token = req.cookies?.jwt || req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+}
+
+// Routes
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // Replace with your actual user validation
+  const validUser = username === "test" && password === "123"; // Demo only
+  
+  if (!validUser) return res.status(401).json({ error: "Invalid credentials" });
+
+  const token = jwt.sign(
+    { userId: 123, username },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+
+  res.cookie('jwt', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict'
+  }).json({ message: "Logged in successfully" });
 });
 
-// MongoDB connection (optimized for production)
-const connectDB = async () => {
-  try {
-    await mongoose.connect(MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-      retryWrites: true,
-      w: 'majority'
-    });
-    console.log('✅ MongoDB connected successfully');
-  } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-    process.exit(1);
-  }
-};
+app.get('/protected', authenticateToken, (req, res) => {
+  res.json({ message: `Hello ${req.user.username}` });
+});
 
-// Secure Socket.IO configuration
+// Socket.IO Setup
 const io = socketIo(server, {
   cors: {
-    origin: FRONTEND_URL,
-    methods: ['GET', 'POST'],
+    origin: process.env.FRONTEND_URL,
+    methods: ["GET", "POST"],
     credentials: true
-  },
-  transports: ['websocket', 'polling'],
-  connectionStateRecovery: {
-    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
-    skipMiddlewares: true
   }
 });
 
-// Socket.IO authentication middleware
+// Socket.IO Authentication
 io.use((socket, next) => {
-  const { token } = socket.handshake.auth;
-  // Add your JWT/API key validation logic here
-  if (process.env.NODE_ENV === 'development' || isValidToken(token)) {
-    return next();
-  }
-  next(new Error('Authentication error'));
-});
+  const token = socket.handshake.auth.token || socket.handshake.headers.cookie?.split('=')[1];
+  if (!token) return next(new Error('Authentication error'));
 
-// Game initialization
-const initializeGame = (roomCode, hostPlayer) => {
-  const gameState = GameEngine.initializeGame([hostPlayer]);
-  RoomManager.createRoom(roomCode, gameState);
-  return gameState;
-};
-
-// API routes
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    uptime: process.uptime(),
-    timestamp: new Date()
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return next(new Error('Invalid token'));
+    socket.user = decoded;
+    next();
   });
 });
 
-// Socket.IO event handlers
+// Socket.IO Event Handlers
 io.on('connection', (socket) => {
-  console.log(`🔌 New connection: ${socket.id}`);
+  console.log(`User connected: ${socket.user.username}`);
 
-  socket.on('createRoom', ({ playerName, avatar }) => {
+  socket.on('createRoom', (data) => {
     const roomCode = RoomManager.generateRoomCode();
-    const gameState = initializeGame(roomCode, {
+    const gameState = GameEngine.initializeGame([{
       id: socket.id,
-      name: playerName,
-      avatar,
+      name: socket.user.username,
       isHost: true
-    });
+    }]);
     
+    RoomManager.createRoom(roomCode, gameState);
     socket.join(roomCode);
     socket.emit('roomCreated', { roomCode, gameState });
-    console.log(`🚪 Room created: ${roomCode}`);
   });
 
-  socket.on('joinRoom', ({ roomCode, playerName, avatar }) => {
-    const room = RoomManager.getRoom(roomCode);
-    if (!room || room.players.length >= 8) {
-      return socket.emit('error', 'Room full or not found');
-    }
-
-    const newPlayer = {
-      id: socket.id,
-      name: playerName,
-      avatar,
-      isHost: false
-    };
-
-    GameEngine.addPlayer(room.gameState, newPlayer);
-    socket.join(roomCode);
-    io.to(roomCode).emit('playerJoined', newPlayer);
-    console.log(`🎮 Player joined: ${playerName} in ${roomCode}`);
-  });
-
-  socket.on('gameAction', ({ roomCode, action, data }) => {
-    const room = RoomManager.getRoom(roomCode);
-    if (!room) return;
-
-    try {
-      const updatedState = GameEngine.handleAction(
-        room.gameState,
-        action,
-        { ...data, playerId: socket.id }
-      );
-      
-      room.gameState = updatedState;
-      io.to(roomCode).emit('gameUpdate', updatedState);
-    } catch (err) {
-      socket.emit('error', err.message);
-      console.error(`⚠️ Action error: ${err.message}`);
-    }
-  });
-
-  socket.on('disconnect', () => {
-    RoomManager.handleDisconnect(socket.id);
-    console.log(`❌ Disconnected: ${socket.id}`);
-  });
+  // Add other game event handlers...
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('🔥 Server error:', err.stack);
-  res.status(500).json({ error: 'Internal server error' });
+// Start Server
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
-
-// Start server
-const startServer = async () => {
-  await connectDB();
-  server.listen(PORT, () => {
-    console.log(`
-      🚀 Server running on port ${PORT}
-      🌐 CORS configured for: ${FRONTEND_URL}
-      📡 Socket.IO ready (${Object.keys(io.engine.clients).length} active connections)
-    `);
-  });
-};
-
-startServer();
-
-// Helper function (replace with your auth logic)
-function isValidToken(token) {
-  // Implement JWT verification or API key check
-  return !!token; // Simplified for example
-}

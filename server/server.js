@@ -5,114 +5,69 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const mongoose = require('mongoose');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
+
+// Improved CORS configuration
+const corsOptions = {
+  origin: process.env.FRONTEND_URL || 'https://mgt-tooza.onrender.com',
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+
+// Configure Socket.IO with proper CORS
 const io = socketIo(server, {
   cors: {
-    origin: "*", // For testing only - restrict in production
-    methods: ["GET", "POST"]
-  }
+    origin: process.env.FRONTEND_URL || 'https://mgt-tooza.onrender.com',
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling'] // Explicitly specify transports
 });
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/card-game', {
+// MongoDB Connection - use environment variable
+mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
-  useUnifiedTopology: true
-});
-const db = mongoose.connection;
-db.on('error', console.error.bind(console, 'MongoDB connection error:'));
-db.once('open', () => console.log('Connected to MongoDB'));
+  useUnifiedTopology: true,
+  retryWrites: true,
+  w: 'majority'
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
 
-// MongoDB Schemas
-const roomSchema = new mongoose.Schema({
-  code: String,
-  gameState: Object,
-  createdAt: { type: Date, default: Date.now, expires: 86400 } // Auto-delete after 24h
-});
-const Room = mongoose.model('Room', roomSchema);
+// ... (keep your existing schemas and models)
 
-const playerSchema = new mongoose.Schema({
-  id: String,
-  roomCode: String,
-  name: String,
-  socketId: String
-});
-const Player = mongoose.model('Player', playerSchema);
+// Serve static files if needed
+app.use(express.static(path.join(__dirname, 'public')));
 
-app.use(cors());
-app.use(express.json());
-
-// Import game logic
-const GameEngine = require('./gameEngine');
-
-const PORT = process.env.PORT || 3001;
-
-// HTTP Routes
+// API Routes with better error handling
 app.post('/api/create-room', async (req, res) => {
-  const { playerName } = req.body;
-  const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const playerId = uuidv4();
-  
-  const game = new GameEngine(roomCode);
-  game.addPlayer(playerId, playerName);
-  
-  // Save to MongoDB
-  const room = new Room({
-    code: roomCode,
-    gameState: game.getGameState()
-  });
-  
-  const player = new Player({
-    id: playerId,
-    roomCode,
-    name: playerName
-  });
-
   try {
-    await room.save();
-    await player.save();
-    
-    res.json({
-      success: true,
-      roomCode,
-      playerId,
-      gameState: game.getGameState()
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/join-room', async (req, res) => {
-  const { playerName, roomCode } = req.body;
-  
-  try {
-    const room = await Room.findOne({ code: roomCode });
-    if (!room) {
-      return res.json({ success: false, error: 'Room not found' });
+    const { playerName } = req.body;
+    if (!playerName) {
+      return res.status(400).json({ success: false, error: 'Player name is required' });
     }
+
+    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const playerId = uuidv4();
     
     const game = new GameEngine(roomCode);
-    game.players = room.gameState.players;
-    
-    if (game.players.length >= 4) {
-      return res.json({ success: false, error: 'Room is full' });
-    }
-    
-    const playerId = uuidv4();
     game.addPlayer(playerId, playerName);
     
-    // Update MongoDB
-    room.gameState = game.getGameState();
-    await room.save();
-    
-    const player = new Player({
-      id: playerId,
-      roomCode,
-      name: playerName
-    });
-    await player.save();
+    const [room, player] = await Promise.all([
+      new Room({
+        code: roomCode,
+        gameState: game.getGameState()
+      }).save(),
+      new Player({
+        id: playerId,
+        roomCode,
+        name: playerName
+      }).save()
+    ]);
     
     res.json({
       success: true,
@@ -121,77 +76,77 @@ app.post('/api/join-room', async (req, res) => {
       gameState: game.getGameState()
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('Create room error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
-// WebSocket handling
-io.on('connection', async (socket) => {
-  console.log('Player connected:', socket.id);
-  
+// Improved WebSocket handling
+io.on('connection', (socket) => {
+  console.log('New connection:', socket.id);
+
   socket.on('join-game', async ({ playerId, roomCode }) => {
     try {
-      const player = await Player.findOne({ id: playerId, roomCode });
-      if (!player) return;
-      
+      const [player, room] = await Promise.all([
+        Player.findOne({ id: playerId, roomCode }),
+        Room.findOne({ code: roomCode })
+      ]);
+
+      if (!player || !room) {
+        return socket.emit('error', { message: 'Invalid room or player' });
+      }
+
       player.socketId = socket.id;
       await player.save();
-      
-      const room = await Room.findOne({ code: roomCode });
-      if (!room) return;
       
       socket.join(roomCode);
       socket.playerId = playerId;
       socket.roomCode = roomCode;
       
-      // Send current game state
       socket.emit('game-state', room.gameState);
     } catch (err) {
       console.error('Join game error:', err);
+      socket.emit('error', { message: 'Failed to join game' });
     }
   });
-  
+
   socket.on('game-action', async ({ action, data }) => {
-    const { playerId, roomCode } = socket;
-    
     try {
+      const { playerId, roomCode } = socket;
+      if (!playerId || !roomCode) return;
+
       const room = await Room.findOne({ code: roomCode });
       if (!room) return;
-      
+
       const game = new GameEngine(roomCode);
-      game.players = room.gameState.players;
-      game.gamePhase = room.gameState.gamePhase;
-      // ... copy all other game state properties
+      Object.assign(game, room.gameState); // Restore full game state
       
       const result = game.handleAction(action, playerId, data);
-      
-      if (result.success) {
-        // Save updated state to MongoDB
-        room.gameState = game.getGameState();
-        await room.save();
-        
-        // Broadcast updated state
-        io.to(roomCode).emit('game-state', room.gameState);
-        
-        // Handle AI turns
-        if (game.shouldProcessAITurn()) {
-          setTimeout(async () => {
-            game.processAITurn();
-            room.gameState = game.getGameState();
-            await room.save();
-            io.to(roomCode).emit('game-state', room.gameState);
-          }, 1000);
-        }
-      } else {
-        socket.emit('error', { message: result.error });
+      if (!result.success) {
+        return socket.emit('error', { message: result.error });
+      }
+
+      // Update and broadcast game state
+      room.gameState = game.getGameState();
+      await room.save();
+      io.to(roomCode).emit('game-state', room.gameState);
+
+      // Handle AI turns if needed
+      if (game.shouldProcessAITurn()) {
+        setTimeout(async () => {
+          game.processAITurn();
+          room.gameState = game.getGameState();
+          await room.save();
+          io.to(roomCode).emit('game-state', room.gameState);
+        }, 1000);
       }
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      console.error('Game action error:', error);
+      socket.emit('error', { message: 'Action failed' });
     }
   });
-  
+
   socket.on('disconnect', async () => {
-    console.log('Player disconnected:', socket.id);
     try {
       await Player.findOneAndUpdate(
         { socketId: socket.id },
@@ -203,6 +158,12 @@ io.on('connection', async (socket) => {
   });
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy' });
+});
+
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`Game server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });

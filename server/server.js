@@ -10,25 +10,35 @@ const path = require('path');
 const app = express();
 const server = http.createServer(app);
 
-// Improved CORS configuration
+// Improved CORS configuration with dynamic origin
 const corsOptions = {
-  origin: process.env.FRONTEND_URL || 'https://mgt-tooza.onrender.com',
+  origin: (origin, callback) => {
+    const allowedOrigins = [
+      process.env.FRONTEND_URL,
+      'https://mgt-tooza.onrender.com',
+      'http://localhost:3000' // Add local dev URL
+    ].filter(Boolean);
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.error('CORS rejected origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true
 };
 
 app.use(cors(corsOptions));
 
-// Configure Socket.IO with proper CORS
+// Configure Socket.IO with proper CORS and timeouts
 const io = socketIo(server, {
-  cors: {
-    origin: process.env.FRONTEND_URL || 'https://mgt-tooza.onrender.com',
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  transports: ['websocket', 'polling'] // Explicitly specify transports
+  cors: corsOptions,
+  transports: ['websocket', 'polling'],
+  pingTimeout: 10000,
+  pingInterval: 5000
 });
 
-// MongoDB Connection - use environment variable
+// MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -38,12 +48,10 @@ mongoose.connect(process.env.MONGODB_URI, {
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
-// ... (keep your existing schemas and models)
-
-// Serve static files if needed
+// Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// API Routes with better error handling
+// API Routes
 app.post('/api/create-room', async (req, res) => {
   try {
     const { playerName } = req.body;
@@ -81,11 +89,12 @@ app.post('/api/create-room', async (req, res) => {
   }
 });
 
-// Improved WebSocket handling
+// WebSocket handling
 io.on('connection', (socket) => {
-  console.log('New connection:', socket.id);
+  console.log('New connection:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
   socket.on('join-game', async ({ playerId, roomCode }) => {
+    const start = Date.now();
     try {
       const [player, room] = await Promise.all([
         Player.findOne({ id: playerId, roomCode }),
@@ -104,6 +113,7 @@ io.on('connection', (socket) => {
       socket.roomCode = roomCode;
       
       socket.emit('game-state', room.gameState);
+      console.log('Join game processed in', Date.now() - start, 'ms');
     } catch (err) {
       console.error('Join game error:', err);
       socket.emit('error', { message: 'Failed to join game' });
@@ -111,6 +121,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game-action', async ({ action, data }) => {
+    const start = Date.now();
     try {
       const { playerId, roomCode } = socket;
       if (!playerId || !roomCode) return;
@@ -119,27 +130,27 @@ io.on('connection', (socket) => {
       if (!room) return;
 
       const game = new GameEngine(roomCode);
-      Object.assign(game, room.gameState); // Restore full game state
+      Object.assign(game, room.gameState);
       
       const result = game.handleAction(action, playerId, data);
       if (!result.success) {
         return socket.emit('error', { message: result.error });
       }
 
-      // Update and broadcast game state
       room.gameState = game.getGameState();
       await room.save();
       io.to(roomCode).emit('game-state', room.gameState);
 
-      // Handle AI turns if needed
       if (game.shouldProcessAITurn()) {
         setTimeout(async () => {
           game.processAITurn();
           room.gameState = game.getGameState();
           await room.save();
           io.to(roomCode).emit('game-state', room.gameState);
+          console.log('AI turn processed in', Date.now() - start, 'ms');
         }, 1000);
       }
+      console.log('Game action processed in', Date.now() - start, 'ms');
     } catch (error) {
       console.error('Game action error:', error);
       socket.emit('error', { message: 'Action failed' });
@@ -152,11 +163,22 @@ io.on('connection', (socket) => {
         { socketId: socket.id },
         { $set: { socketId: null } }
       );
+      console.log('Client disconnected:', socket.id);
     } catch (err) {
       console.error('Disconnect update error:', err);
     }
   });
 });
+
+// Clean up stale players hourly
+setInterval(async () => {
+  try {
+    await Player.deleteMany({ socketId: null, updatedAt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
+    console.log('Cleaned up stale players');
+  } catch (err) {
+    console.error('Cleanup error:', err);
+  }
+}, 60 * 60 * 1000);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

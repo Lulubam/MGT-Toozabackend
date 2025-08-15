@@ -1,6 +1,6 @@
 // server.js
-const GameEngine = require('./game/GameEngine');
 require('dotenv').config();
+const GameEngine = require('./game/GameEngine');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');

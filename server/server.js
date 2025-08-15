@@ -21,44 +21,42 @@ const app = express();
 const server = http.createServer(app);
 
 // Improved CORS configuration with dynamic origin
-const corsOptions = {
-    origin: (origin, callback) => {
-        const allowedOrigins = [
-            process.env.FRONTEND_URL,
-            'https://mgt-tooza.onrender.com',
-             'https://mgt-tooza.onrender.com',
-            'http://localhost:3000' // Add local dev URL
-        ].filter(Boolean);
+const createOriginValidator = () => {
+    const allowedOrigins = [
+        process.env.FRONTEND_URL,
+        'https://mgt-tooza.onrender.com',
+        'http://localhost:3000'
+    ].filter(Boolean);
 
+    return (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
             console.error('CORS rejected origin:', origin);
             callback(new Error('Not allowed by CORS'));
         }
-    },
+    };
+};
+
+const corsOptions = {
+    origin: createOriginValidator(),
     credentials: true
 };
 
 // Middleware
 app.use(cors(corsOptions));
-app.use(express.json()); // <--- CRUCIAL: This line parses JSON request bodies
+app.use(express.json());
 
-// Configure Socket.IO with proper CORS and timeouts
+// Configure Socket.IO
 const io = socketIo(server, {
-    cors: corsOptions,
+    cors: {
+        origin: createOriginValidator(),
+        credentials: true
+    },
     transports: ['websocket', 'polling'],
     pingTimeout: 10000,
     pingInterval: 5000
 });
-
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI, {
-    retryWrites: true,
-    w: 'majority'
-})
-.then(() => console.log('Connected to MongoDB'))
-.catch(err => console.error('MongoDB connection error:', err));
 
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));

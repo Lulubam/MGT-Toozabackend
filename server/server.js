@@ -1,6 +1,8 @@
 // server.js
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
+const Player = require('./models/Player');
+const Room = require('./models/Room');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -24,66 +26,7 @@ mongoose.connect(process.env.MONGODB_URI, {
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
-// =========================================================================
-// Model Definitions - ADD THESE!
-// =========================================================================
-
-// Player Schema - Remove unique constraint on username to allow duplicates
-const playerSchema = new mongoose.Schema({
-    username: { 
-        type: String, 
-        required: true 
-        // Removed: unique: true - this was causing duplicate key errors
-    },
-    roomCode: { 
-        type: String, 
-        required: true 
-    },
-    socketId: { 
-        type: String, 
-        default: null 
-    },
-    isActive: { 
-        type: Boolean, 
-        default: true 
-    }
-}, { 
-    timestamps: true 
-});
-
-// Add compound index for username + roomCode instead of unique username
-playerSchema.index({ username: 1, roomCode: 1 }, { unique: true });
-
-const Player = mongoose.model('Player', playerSchema);
-
-// Room Schema
-const roomSchema = new mongoose.Schema({
-    code: { 
-        type: String, 
-        required: true, 
-        unique: true 
-    },
-    players: [{ 
-        type: mongoose.Schema.Types.ObjectId, 
-        ref: 'Player' 
-    }],
-    gameState: { 
-        type: mongoose.Schema.Types.Mixed, 
-        default: {} 
-    },
-    isActive: { 
-        type: Boolean, 
-        default: true 
-    },
-    maxPlayers: { 
-        type: Number, 
-        default: 4 
-    }
-}, { 
-    timestamps: true 
-});
-
-const Room = mongoose.model('Room', roomSchema);
+// Models are now imported from separate files
 
 // GameEngine is now imported from ./game/GameEngine.js
 
@@ -135,33 +78,57 @@ app.use(express.static(path.join(__dirname, 'public')));
 // =========================================================================
 
 app.post('/api/create-room', async (req, res) => {
+    console.log('=== CREATE ROOM REQUEST ===');
+    console.log('Request body:', req.body);
+    
     try {
         const { playerName } = req.body;
         if (!playerName) {
+            console.log('❌ No player name provided');
             return res.status(400).json({ success: false, error: 'Player name is required' });
         }
 
         const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+        console.log('✅ Generated room code:', roomCode);
         
-        // Use the placeholder GameEngine
+        // Use the GameEngine
+        console.log('Creating GameEngine instance...');
         const game = new GameEngine(roomCode);
+        console.log('✅ GameEngine created');
         
-        // Create the player and room documents
+        // Create the player document
+        console.log('Creating player document...');
         const playerDoc = new Player({ username: playerName, roomCode });
         await playerDoc.save();
+        console.log('✅ Player saved:', playerDoc._id);
 
+        // Add player to the game state
+        console.log('Adding player to game state...');
+        const addPlayerResult = game.addPlayer({
+            id: playerDoc._id.toString(),
+            username: playerName,
+            socketId: null
+        });
+        console.log('✅ Player added to game:', addPlayerResult);
+
+        // Create the room document
+        console.log('Creating room document...');
         const roomDoc = new Room({ code: roomCode, gameState: game.getGameState() });
         roomDoc.players.push(playerDoc._id);
         await roomDoc.save();
+        console.log('✅ Room saved:', roomDoc._id);
 
-        res.json({
+        const response = {
             success: true,
             roomCode,
             playerId: playerDoc._id,
             gameState: game.getGameState()
-        });
+        };
+        
+        console.log('✅ Sending response:', response);
+        res.json(response);
     } catch (err) {
-        console.error('Create room error:', err);
+        console.error('❌ Create room error:', err);
         if (err.code === 11000) {
             // Handle duplicate key error
             return res.status(400).json({ 
@@ -202,7 +169,25 @@ app.post('/api/join-room', async (req, res) => {
         const playerDoc = new Player({ username: playerName, roomCode });
         await playerDoc.save();
 
-        // Add the new player to the room's players array
+        // Add player to the game state using GameEngine
+        const game = new GameEngine(roomCode);
+        // Load existing game state
+        Object.assign(game.gameState, room.gameState);
+        
+        // Add the new player to the game
+        const addPlayerResult = game.addPlayer({
+            id: playerDoc._id.toString(),
+            username: playerName,
+            socketId: null
+        });
+        
+        if (!addPlayerResult.success) {
+            await Player.findByIdAndDelete(playerDoc._id); // Clean up
+            return res.status(400).json(addPlayerResult);
+        }
+
+        // Update room with new game state
+        room.gameState = game.getGameState();
         room.players.push(playerDoc._id);
         await room.save();
 
@@ -232,25 +217,41 @@ io.on('connection', (socket) => {
 
     socket.on('join-game', async ({ playerId, roomCode }) => {
         const start = Date.now();
+        console.log('=== JOIN GAME REQUEST ===');
+        console.log('Player ID:', playerId);
+        console.log('Room Code:', roomCode);
+        
         try {
+            console.log('Looking up player and room...');
             const player = await Player.findById(playerId);
             const room = await Room.findOne({ code: roomCode });
 
-            if (!player || !room) {
-                return socket.emit('error', { message: 'Invalid room or player' });
+            if (!player) {
+                console.log('❌ Player not found:', playerId);
+                return socket.emit('error', { message: 'Invalid player' });
             }
+            
+            if (!room) {
+                console.log('❌ Room not found:', roomCode);
+                return socket.emit('error', { message: 'Invalid room' });
+            }
+
+            console.log('✅ Player found:', player.username);
+            console.log('✅ Room found:', room.code);
 
             player.socketId = socket.id;
             await player.save();
+            console.log('✅ Player socket updated');
             
             socket.join(roomCode);
             socket.playerId = playerId;
             socket.roomCode = roomCode;
             
+            console.log('✅ Sending game state to client');
             socket.emit('game-state', room.gameState);
             console.log('Join game processed in', Date.now() - start, 'ms');
         } catch (err) {
-            console.error('Join game error:', err);
+            console.error('❌ Join game error:', err);
             socket.emit('error', { message: 'Failed to join game' });
         }
     });

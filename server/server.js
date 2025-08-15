@@ -1,5 +1,5 @@
 // server.js
-const GameEngine = require('./game/gameEngine');
+const GameEngine = require('./game/GameEngine');
 require('dotenv').config();
 const express = require('express');
 const http = require('http');

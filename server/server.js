@@ -1,26 +1,95 @@
 // server.js
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
-const Player = require('./models/Player');
-const Room = require('./models/Room');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 const mongoose = require('mongoose');
 const path = require('path');
-
-// NOTE: I've included the model code for Room.js and Player.js below
-// For production, you should put these in their own files and import them like this:
-// const GameEngine = require('./game/gameEngine');
-// const Room = require('./models/Room');
-// const Player = require('./models/Player');
 
 const app = express();
 const server = http.createServer(app);
 
-// Improved CORS configuration with dynamic origin
+// =========================================================================
+// MongoDB Connection - ADD THIS BACK!
+// =========================================================================
+mongoose.connect(process.env.MONGODB_URI, {
+    retryWrites: true,
+    w: 'majority',
+    maxPoolSize: 10,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// =========================================================================
+// Model Definitions - ADD THESE!
+// =========================================================================
+
+// Player Schema - Remove unique constraint on username to allow duplicates
+const playerSchema = new mongoose.Schema({
+    username: { 
+        type: String, 
+        required: true 
+        // Removed: unique: true - this was causing duplicate key errors
+    },
+    roomCode: { 
+        type: String, 
+        required: true 
+    },
+    socketId: { 
+        type: String, 
+        default: null 
+    },
+    isActive: { 
+        type: Boolean, 
+        default: true 
+    }
+}, { 
+    timestamps: true 
+});
+
+// Add compound index for username + roomCode instead of unique username
+playerSchema.index({ username: 1, roomCode: 1 }, { unique: true });
+
+const Player = mongoose.model('Player', playerSchema);
+
+// Room Schema
+const roomSchema = new mongoose.Schema({
+    code: { 
+        type: String, 
+        required: true, 
+        unique: true 
+    },
+    players: [{ 
+        type: mongoose.Schema.Types.ObjectId, 
+        ref: 'Player' 
+    }],
+    gameState: { 
+        type: mongoose.Schema.Types.Mixed, 
+        default: {} 
+    },
+    isActive: { 
+        type: Boolean, 
+        default: true 
+    },
+    maxPlayers: { 
+        type: Number, 
+        default: 4 
+    }
+}, { 
+    timestamps: true 
+});
+
+const Room = mongoose.model('Room', roomSchema);
+
+// GameEngine is now imported from ./game/GameEngine.js
+
+// =========================================================================
+// CORS Configuration
+// =========================================================================
 const createOriginValidator = () => {
     const allowedOrigins = [
         process.env.FRONTEND_URL,
@@ -61,7 +130,6 @@ const io = socketIo(server, {
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-
 // =========================================================================
 // API Routes
 // =========================================================================
@@ -94,6 +162,13 @@ app.post('/api/create-room', async (req, res) => {
         });
     } catch (err) {
         console.error('Create room error:', err);
+        if (err.code === 11000) {
+            // Handle duplicate key error
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Player name already exists in this room' 
+            });
+        }
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -110,6 +185,20 @@ app.post('/api/join-room', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Room not found' });
         }
 
+        // Check if room is full
+        if (room.players.length >= room.maxPlayers) {
+            return res.status(400).json({ success: false, error: 'Room is full' });
+        }
+
+        // Check if username already exists in this room
+        const existingPlayer = await Player.findOne({ username: playerName, roomCode });
+        if (existingPlayer) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Player name already exists in this room' 
+            });
+        }
+
         const playerDoc = new Player({ username: playerName, roomCode });
         await playerDoc.save();
 
@@ -124,6 +213,12 @@ app.post('/api/join-room', async (req, res) => {
         });
     } catch (err) {
         console.error('Join room error:', err);
+        if (err.code === 11000) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Player name already exists in this room' 
+            });
+        }
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -213,7 +308,11 @@ io.on('connection', (socket) => {
 // Clean up stale players hourly
 setInterval(async () => {
     try {
-        await Player.deleteMany({ socketId: null, updatedAt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        await Player.deleteMany({ 
+            socketId: null, 
+            updatedAt: { $lt: oneDayAgo } 
+        });
         console.log('Cleaned up stale players');
     } catch (err) {
         console.error('Cleanup error:', err);
@@ -222,7 +321,16 @@ setInterval(async () => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'healthy' });
+    res.status(200).json({ 
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({ message: 'Game Server is running' });
 });
 
 const PORT = process.env.PORT || 3001;

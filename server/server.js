@@ -25,6 +25,7 @@ const corsOptions = {
         const allowedOrigins = [
             process.env.FRONTEND_URL,
             'https://mgt-tooza.onrender.com',
+             'https://mgt-tooza.onrender.com',
             'http://localhost:3000' // Add local dev URL
         ].filter(Boolean);
 

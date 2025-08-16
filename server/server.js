@@ -70,6 +70,9 @@ const io = socketIo(server, {
     pingInterval: 5000
 });
 
+// Make io available to routes
+app.set('io', io);
+
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -171,7 +174,7 @@ app.post('/api/join-room', async (req, res) => {
 
         // Add player to the game state using GameEngine
         const game = new GameEngine(roomCode);
-        // Load existing game state
+        // Load existing game state from room
         Object.assign(game.gameState, room.gameState);
         
         // Add the new player to the game
@@ -186,15 +189,22 @@ app.post('/api/join-room', async (req, res) => {
             return res.status(400).json(addPlayerResult);
         }
 
-        // Update room with new game state
+        // Update room with new game state and add to players array
         room.gameState = game.getGameState();
         room.players.push(playerDoc._id);
         await room.save();
 
+        // Notify all players in the room about the new player
+        const io = req.app.get('io'); // We'll need to set this up
+        if (io) {
+            io.to(roomCode).emit('game-state', room.gameState);
+        }
+
         res.json({
             success: true,
             playerId: playerDoc._id,
-            roomCode
+            roomCode,
+            gameState: room.gameState
         });
     } catch (err) {
         console.error('Join room error:', err);
@@ -204,6 +214,49 @@ app.post('/api/join-room', async (req, res) => {
                 error: 'Player name already exists in this room' 
             });
         }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Add endpoint to start the game
+app.post('/api/start-game', async (req, res) => {
+    try {
+        const { roomCode, playerId } = req.body;
+        if (!roomCode || !playerId) {
+            return res.status(400).json({ success: false, error: 'Room code and player ID required' });
+        }
+
+        const room = await Room.findOne({ code: roomCode });
+        if (!room) {
+            return res.status(404).json({ success: false, error: 'Room not found' });
+        }
+
+        // Check if player is the dealer (only dealer can start)
+        const game = new GameEngine(roomCode);
+        Object.assign(game.gameState, room.gameState);
+        
+        const player = game.gameState.players.find(p => p.id === playerId);
+        if (!player || !player.isDealer) {
+            return res.status(403).json({ success: false, error: 'Only the dealer can start the game' });
+        }
+
+        const startResult = game.startGame();
+        if (!startResult.success) {
+            return res.status(400).json(startResult);
+        }
+
+        // Save updated game state
+        room.gameState = game.getGameState();
+        await room.save();
+
+        // Notify all players
+        const io = req.app.get('io');
+        io.to(roomCode).emit('game-state', room.gameState);
+        io.to(roomCode).emit('game-started', { message: 'Game has started!' });
+
+        res.json({ success: true, gameState: room.gameState });
+    } catch (err) {
+        console.error('Start game error:', err);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -239,9 +292,23 @@ io.on('connection', (socket) => {
             console.log('✅ Player found:', player.username);
             console.log('✅ Room found:', room.code);
 
+            // Update player's socket ID
             player.socketId = socket.id;
             await player.save();
             console.log('✅ Player socket updated');
+            
+            // Update the game state with the player's socket ID
+            const game = new GameEngine(roomCode);
+            Object.assign(game.gameState, room.gameState);
+            
+            // Update the player's socket ID in the game state
+            const gamePlayer = game.gameState.players.find(p => p.id === playerId);
+            if (gamePlayer) {
+                gamePlayer.socketId = socket.id;
+                room.gameState = game.getGameState();
+                await room.save();
+                console.log('✅ Game state updated with socket ID');
+            }
             
             socket.join(roomCode);
             socket.playerId = playerId;
@@ -249,6 +316,13 @@ io.on('connection', (socket) => {
             
             console.log('✅ Sending game state to client');
             socket.emit('game-state', room.gameState);
+            
+            // Notify other players that someone joined
+            socket.to(roomCode).emit('player-joined', { 
+                username: player.username,
+                playerId: playerId 
+            });
+            
             console.log('Join game processed in', Date.now() - start, 'ms');
         } catch (err) {
             console.error('❌ Join game error:', err);

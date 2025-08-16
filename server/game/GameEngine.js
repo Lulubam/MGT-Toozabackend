@@ -32,6 +32,8 @@ class GameEngine {
                     return this.playCard(playerId, data.cardId);
                 case 'dealCards':
                     return this.dealCards();
+                case 'joinGame':
+                    return this.joinGame(playerId);
                 // Add your other actions
                 default:
                     return { success: false, error: 'Unknown action' };
@@ -59,23 +61,60 @@ class GameEngine {
             return { success: false, error: 'Need at least 2 players to start' };
         }
         
-        this.gameState = GameEngine.initializeGame(this.gameState.players);
-        this.gameState.status = 'playing';
+        // Initialize the game with current players
+        const initializedState = GameEngine.initializeGame(this.gameState.players);
+        // Keep the existing players but update other properties
+        this.gameState = {
+            ...initializedState,
+            status: 'playing',
+            players: this.gameState.players.map((player, index) => ({
+                ...player,
+                cards: [],
+                points: 0,
+                isDealer: index === 0,
+                isCurrent: index === 0
+            }))
+        };
+        
+        // Deal cards to players
+        this.dealCards();
+        
         return { success: true };
     }
 
     addPlayer(player) {
-        if (this.gameState.status === 'waiting') {
-            this.gameState.players.push({
-                ...player,
-                cards: [],
-                points: 0,
-                isDealer: this.gameState.players.length === 0,
-                isCurrent: this.gameState.players.length === 0
-            });
-            return { success: true };
+        // Check if game already started
+        if (this.gameState.status !== 'waiting') {
+            return { success: false, error: 'Game already started' };
         }
-        return { success: false, error: 'Game already started' };
+        
+        // Check if player already exists
+        const existingPlayer = this.gameState.players.find(p => p.id === player.id);
+        if (existingPlayer) {
+            return { success: false, error: 'Player already in game' };
+        }
+        
+        // Add player to game state
+        this.gameState.players.push({
+            id: player.id,
+            username: player.username,
+            socketId: player.socketId,
+            cards: [],
+            points: 0,
+            isDealer: this.gameState.players.length === 0, // First player is dealer
+            isCurrent: this.gameState.players.length === 0 // First player goes first
+        });
+        
+        console.log(`Player ${player.username} added to game. Total players: ${this.gameState.players.length}`);
+        return { success: true };
+    }
+
+    joinGame(playerId) {
+        const player = this.gameState.players.find(p => p.id === playerId);
+        if (player) {
+            return { success: true, message: 'Player already in game' };
+        }
+        return { success: false, error: 'Player not found in game' };
     }
 
     playCard(playerId, cardId) {
@@ -91,8 +130,26 @@ class GameEngine {
 
     dealCards() {
         this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createDeck());
-        // Add your dealing logic here
+        
+        // Deal cards to each player (adjust number as needed)
+        const cardsPerPlayer = Math.floor(this.gameState.deck.length / this.gameState.players.length);
+        
+        this.gameState.players.forEach((player, playerIndex) => {
+            player.cards = this.gameState.deck.slice(
+                playerIndex * cardsPerPlayer,
+                (playerIndex + 1) * cardsPerPlayer
+            );
+        });
+        
         return { success: true };
+    }
+
+    getValidCards(playerId) {
+        const player = this.gameState.players.find(p => p.id === playerId);
+        if (!player) return [];
+        
+        // Return all cards for now - implement your game's validity rules
+        return player.cards;
     }
 
     // STATIC METHODS (your existing methods)

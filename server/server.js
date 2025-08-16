@@ -1,7 +1,7 @@
 // server.js
 // Corrected import paths
 require('dotenv').config();
-const GameEngine = require('../game/GameEngine');
+const GameEngine = require('./game/GameEngine');
 const Player = require('../models/Player');
 const Room = require('../models/Room');
 const express = require('express');

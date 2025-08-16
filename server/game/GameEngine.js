@@ -30,7 +30,7 @@ class GameEngine {
         try {
             switch(action) {
                 case 'startGame':
-                    return this.startGame();
+                    return this.startGame(playerId);
                 case 'playCard':
                     return this.playCard(playerId, data.cardId);
                 case 'dealCards':
@@ -45,384 +45,301 @@ class GameEngine {
                     return { success: false, error: 'Unknown action' };
             }
         } catch (error) {
+            console.error(`Error handling action ${action}:`, error);
             return { success: false, error: error.message };
         }
     }
 
-    // REQUIRED: Instance method for the server
-    shouldProcessAITurn() {
-        if (this.gameState.status !== 'playing') return false;
-        
-        const currentPlayer = this.getCurrentPlayer();
-        return currentPlayer && currentPlayer.isAI;
-    }
-
-    // REQUIRED: Instance method for the server
-    processAITurn() {
-        console.log('Processing AI turn...');
-        
-        const currentPlayer = this.getCurrentPlayer();
-        if (!currentPlayer || !currentPlayer.isAI) {
-            return { success: false, error: 'Not AI turn' };
-        }
-
-        // AI decision making based on difficulty level
-        const validCards = this.getValidCards(currentPlayer.id);
-        
-        if (validCards.length === 0) {
-            // AI must draw a card
-            const drawResult = this.drawCard(currentPlayer.id);
-            if (!drawResult.success) {
-                return this.passTurn(currentPlayer.id);
-            }
-            
-            // Check if the drawn card can be played
-            const newValidCards = this.getValidCards(currentPlayer.id);
-            const drawnCard = currentPlayer.cards[currentPlayer.cards.length - 1];
-            
-            if (newValidCards.find(card => card.id === drawnCard.id)) {
-                // AI might play the drawn card based on difficulty
-                if (this.shouldAIPlayCard(currentPlayer, drawnCard)) {
-                    return this.playCard(currentPlayer.id, drawnCard.id);
-                }
-            }
-            
-            return this.passTurn(currentPlayer.id);
-        }
-
-        // Choose the best card to play based on AI level
-        const chosenCard = this.chooseAICard(currentPlayer, validCards);
-        return this.playCard(currentPlayer.id, chosenCard.id);
-    }
-
-    shouldAIPlayCard(player, card) {
-        // Beginner AI: 50% chance to play
-        if (player.level === 'beginner') return Math.random() < 0.5;
-        
-        // Intermediate AI: 75% chance to play
-        if (player.level === 'intermediate') return Math.random() < 0.75;
-        
-        // Advanced AI: Always plays if possible
-        return true;
-    }
-
-    chooseAICard(player, validCards) {
-        if (player.level === 'beginner') {
-            // Random selection
-            return validCards[Math.floor(Math.random() * validCards.length)];
-        }
-        
-        if (player.level === 'intermediate') {
-            // Prefer higher value cards
-            return validCards.reduce((best, card) => 
-                (card.attackValue || 1) > (best.attackValue || 1) ? card : best
-            );
-        }
-        
-        // Advanced AI: Strategic play
-        // Prefer special cards, then high value cards
-        const specialCards = validCards.filter(card => ['3', '4', 'A'].includes(card.rank));
-        if (specialCards.length > 0) {
-            return specialCards.reduce((best, card) => 
-                (card.attackValue || 1) > (best.attackValue || 1) ? card : best
-            );
-        }
-        
-        return validCards.reduce((best, card) => 
-            (card.attackValue || 1) > (best.attackValue || 1) ? card : best
-        );
-    }
-
-    getCurrentPlayer() {
-        return this.gameState.players[this.gameState.currentPlayerIndex];
-    }
-
-    // Game-specific instance methods
-    startGame() {
-        if (this.gameState.players.length < 2) {
-            return { success: false, error: 'Need at least 2 players to start' };
-        }
-        
-        // Initialize the game
-        this.gameState.status = 'playing';
-        this.gameState.gamePhase = 'playing';
-        this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createDeck());
-        
-        // Deal cards to players
-        this.dealCards();
-        
-        // Set first player (dealer starts)
-        const dealerIndex = this.gameState.players.findIndex(p => p.isDealer);
-        this.gameState.currentPlayerIndex = dealerIndex >= 0 ? dealerIndex : 0;
-        this.updateCurrentPlayer();
-        
-        return { success: true };
-    }
-
-    addPlayer(player) {
-        // Check if game already started
-        if (this.gameState.status !== 'waiting') {
-            return { success: false, error: 'Game already started' };
-        }
-        
-        // Check if player already exists
-        const existingPlayer = this.gameState.players.find(p => p.id === player.id);
-        if (existingPlayer) {
-            return { success: false, error: 'Player already in game' };
-        }
-        
-        // Add player to game state
-        const newPlayer = {
-            id: player.id,
-            username: player.username,
-            socketId: player.socketId,
-            cards: [],
-            points: 0,
-            isDealer: this.gameState.players.length === 0, // First player is dealer
-            isCurrent: false,
-            isAI: player.isAI || false,
-            level: player.level || null
-        };
-        
-        this.gameState.players.push(newPlayer);
-        
-        console.log(`Player ${player.username} added to game. Total players: ${this.gameState.players.length}`);
-        return { success: true };
-    }
-
-    joinGame(playerId) {
-        const player = this.gameState.players.find(p => p.id === playerId);
-        if (player) {
-            return { success: true, message: 'Player already in game' };
-        }
-        return { success: false, error: 'Player not found in game' };
-    }
-
-    playCard(playerId, cardId) {
-        const player = this.gameState.players.find(p => p.id === playerId);
-        if (!player) {
-            return { success: false, error: 'Player not found' };
-        }
-
-        // Check if it's player's turn
-        if (!player.isCurrent) {
-            return { success: false, error: 'Not your turn' };
-        }
-
-        const cardIndex = player.cards.findIndex(c => c.id === cardId);
-        if (cardIndex === -1) {
-            return { success: false, error: 'Card not found in hand' };
-        }
-
-        const card = player.cards[cardIndex];
-
-        // Validate card play
-        if (!this.isValidCardPlay(card)) {
-            return { success: false, error: 'Invalid card play' };
-        }
-
-        // Remove card from player's hand
-        player.cards.splice(cardIndex, 1);
-        
-        // Add to current trick
-        this.gameState.currentTrick.push({
-            playerId: playerId,
-            playerName: player.username,
-            card: card
+    // Utility to update player list from the database
+    updatePlayers(dbPlayers) {
+        this.gameState.players = dbPlayers.map(p => {
+            const existingPlayer = this.gameState.players.find(gp => gp._id.toString() === p._id.toString());
+            return {
+                ...existingPlayer,
+                ...p.toObject(),
+                isCurrent: existingPlayer?.isCurrent || false
+            };
         });
-
-        // Update last played card
-        this.gameState.lastPlayedCard = card;
-
-        // Apply card effects
-        this.applyCardEffects(card, player);
-
-        // Check for win condition
-        if (player.cards.length === 0) {
-            this.endGame(player);
-            return { success: true, gameEnded: true, winner: player.username };
+        // Ensure one player is always the current one after an update
+        if (!this.gameState.players.find(p => p.isCurrent) && this.gameState.players.length > 0) {
+            this.gameState.players[0].isCurrent = true;
         }
+    }
 
-        // Move to next player
-        this.nextPlayer();
+    // =========================================================================
+    // Game Flow Methods
+    // =========================================================================
+
+    startGame(playerId) {
+        const dealer = this.gameState.players.find(p => p._id.toString() === playerId);
+        if (!dealer || !dealer.isDealer) {
+            return { success: false, error: 'Only the dealer can start the game.' };
+        }
+        if (this.gameState.players.length < 2) {
+            return { success: false, error: 'Need at least 2 players to start.' };
+        }
         
-        return { success: true };
-    }
-
-    isValidCardPlay(card) {
-        // First card of the game
-        if (!this.gameState.lastPlayedCard) {
-            return true;
-        }
-
-        const lastCard = this.gameState.lastPlayedCard;
-        
-        // Same suit or same rank
-        return card.suit === lastCard.suit || card.rank === lastCard.rank;
-    }
-
-    applyCardEffects(card, player) {
-        switch (card.rank) {
-            case '3': // Spade 3 is special, others make next player draw
-                if (card.suit === '♠') {
-                    // Ultimate card - next player draws 3 and loses turn
-                    this.makeNextPlayerDraw(3);
-                    this.skipNextPlayer();
-                } else {
-                    // Regular 3 - next player draws 1
-                    this.makeNextPlayerDraw(1);
-                }
-                break;
-            case '4': // Skip next player
-                this.skipNextPlayer();
-                break;
-            case 'A': // Reverse direction
-                this.gameState.gameDirection *= -1;
-                break;
-        }
-    }
-
-    makeNextPlayerDraw(numCards) {
-        const nextPlayerIndex = this.getNextPlayerIndex();
-        const nextPlayer = this.gameState.players[nextPlayerIndex];
-        
-        if (nextPlayer) {
-            for (let i = 0; i < numCards; i++) {
-                if (this.gameState.deck.length > 0) {
-                    const drawnCard = this.gameState.deck.pop();
-                    nextPlayer.cards.push(drawnCard);
-                }
-            }
-        }
-    }
-
-    skipNextPlayer() {
-        // Move current player index forward by one additional step
-        this.nextPlayer();
-    }
-
-    nextPlayer() {
-        // Update current player
-        this.gameState.currentPlayerIndex = this.getNextPlayerIndex();
-        this.updateCurrentPlayer();
-    }
-
-    getNextPlayerIndex() {
-        const currentIndex = this.gameState.currentPlayerIndex;
-        const playerCount = this.gameState.players.length;
-        
-        if (this.gameState.gameDirection === 1) {
-            return (currentIndex + 1) % playerCount;
-        } else {
-            return (currentIndex - 1 + playerCount) % playerCount;
-        }
-    }
-
-    updateCurrentPlayer() {
-        // Reset all players' current status
-        this.gameState.players.forEach(p => p.isCurrent = false);
-        
-        // Set current player
-        if (this.gameState.players[this.gameState.currentPlayerIndex]) {
-            this.gameState.players[this.gameState.currentPlayerIndex].isCurrent = true;
-        }
-    }
-
-    drawCard(playerId) {
-        const player = this.gameState.players.find(p => p.id === playerId);
-        if (!player) {
-            return { success: false, error: 'Player not found' };
-        }
-
-        if (!player.isCurrent) {
-            return { success: false, error: 'Not your turn' };
-        }
-
-        if (this.gameState.deck.length === 0) {
-            return { success: false, error: 'No cards left in deck' };
-        }
-
-        const drawnCard = this.gameState.deck.pop();
-        player.cards.push(drawnCard);
-
-        return { success: true, drawnCard };
-    }
-
-    passTurn(playerId) {
-        const player = this.gameState.players.find(p => p.id === playerId);
-        if (!player) {
-            return { success: false, error: 'Player not found' };
-        }
-
-        if (!player.isCurrent) {
-            return { success: false, error: 'Not your turn' };
-        }
-
-        this.nextPlayer();
+        this.gameState.status = 'playing';
+        this.gameState.gamePhase = 'dealing';
+        this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createDeck());
+        this.dealCards();
         return { success: true };
     }
 
     dealCards() {
-        if (this.gameState.deck.length === 0) {
-            this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createDeck());
-        }
-        
-        // Deal 6 cards to each player (standard Whot rules)
-        const cardsPerPlayer = 6;
-        
-        this.gameState.players.forEach((player, playerIndex) => {
-            player.cards = [];
-            for (let i = 0; i < cardsPerPlayer; i++) {
+        // Phase 1: 3 cards
+        for (let i = 0; i < 3; i++) {
+            this.gameState.players.forEach(player => {
                 if (this.gameState.deck.length > 0) {
                     player.cards.push(this.gameState.deck.pop());
                 }
-            }
-        });
+            });
+        }
         
+        // Phase 2: 2 cards
+        for (let i = 0; i < 2; i++) {
+            this.gameState.players.forEach(player => {
+                if (this.gameState.deck.length > 0) {
+                    player.cards.push(this.gameState.deck.pop());
+                }
+            });
+        }
+
+        // Determine the first player to start the trick
+        const dealerIndex = this.gameState.players.findIndex(p => p.isDealer);
+        this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
+        this.updateCurrentPlayer();
+
+        this.gameState.gamePhase = 'playing';
+        
+        return { success: true, message: 'Cards dealt.' };
+    }
+
+    playCard(playerId, cardId) {
+        const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
+
+        if (currentPlayer._id.toString() !== playerId.toString()) {
+            return { success: false, error: 'It is not your turn to play.' };
+        }
+
+        const cardToPlayIndex = currentPlayer.cards.findIndex(card => card.id === cardId);
+        if (cardToPlayIndex === -1) {
+            return { success: false, error: 'Card not found in your hand.' };
+        }
+
+        const cardToPlay = currentPlayer.cards[cardToPlayIndex];
+
+        if (!this.isValidCardPlay(cardToPlay)) {
+            return { success: false, error: 'Invalid card play.' };
+        }
+
+        // Add card to current trick
+        this.gameState.currentTrick.push({
+            card: cardToPlay,
+            playerId: currentPlayer._id,
+            playerName: currentPlayer.username
+        });
+
+        // Remove card from player's hand
+        currentPlayer.cards.splice(cardToPlayIndex, 1);
+        this.gameState.lastPlayedCard = cardToPlay;
+        
+        // Handle trick end logic
+        if (this.gameState.currentTrick.length === this.gameState.players.length) {
+            this.endTrick();
+        } else {
+            this.nextPlayer();
+        }
+
         return { success: true };
     }
 
-    getValidCards(playerId) {
-        const player = this.gameState.players.find(p => p.id === playerId);
-        if (!player) return [];
-        
+    // Checks if a card play is valid based on the last played card (following suit)
+    isValidCardPlay(card) {
         if (!this.gameState.lastPlayedCard) {
-            return player.cards; // First play, any card is valid
+            return true; // First card of a trick, any card is valid
+        }
+        const lastCard = this.gameState.lastPlayedCard;
+
+        // Check if the player has a card of the same suit
+        const hasSameSuit = this.gameState.players[this.gameState.currentPlayerIndex].cards.some(c => c.suit === lastCard.suit);
+
+        // If player has a card of the same suit, they must follow suit.
+        if (hasSameSuit) {
+            return card.suit === lastCard.suit;
         }
 
-        return player.cards.filter(card => this.isValidCardPlay(card));
+        // If no card of the same suit, any card can be played.
+        return true;
     }
 
-    endGame(winner) {
-        this.gameState.status = 'finished';
-        this.gameState.winner = {
-            id: winner.id,
-            username: winner.username
-        };
-        
-        // Calculate scores for all players
-        this.gameState.players.forEach(player => {
-            const cardValues = player.cards.reduce((total, card) => {
-                return total + (card.attackValue || 1);
-            }, 0);
-            player.finalScore = cardValues;
+    // Move to the next player
+    nextPlayer() {
+        this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + this.gameState.gameDirection + this.gameState.players.length) % this.gameState.players.length;
+        this.updateCurrentPlayer();
+    }
+
+    updateCurrentPlayer() {
+        this.gameState.players.forEach((p, index) => {
+            p.isCurrent = (index === this.gameState.currentPlayerIndex);
         });
     }
-
-    // STATIC METHODS (your existing methods)
-    static createDeck() {
-        const suits = ['♠', '♥', '♦', '♣'];
-        const ranks = ['A', '3', '4', '5', '6', '7', '8', '9', '10'];
+    
+    // Logic for ending a trick, determining the winner, and scoring
+    endTrick() {
+        const winningTrickPlay = this.getTrickWinner();
+        const winner = this.gameState.players.find(p => p._id.toString() === winningTrickPlay.playerId.toString());
         
-        return suits.flatMap(suit => 
-            ranks.map(rank => ({
-                rank,
-                suit,
-                id: `${rank}${suit}`,
-                playOrder: this.getPlayOrder(rank),
-                attackValue: this.getAttackValue(rank, suit)
-            }))
-        );
+        if (winner) {
+            // Add the trick to the history
+            this.gameState.trickHistory.push({
+                winner: winner._id,
+                cards: this.gameState.currentTrick
+            });
+            
+            // Move all cards from the trick to the deck
+            this.gameState.deck.push(...this.gameState.currentTrick.map(play => play.card));
+
+            // Determine the player who takes the points
+            let takerIndex = this.gameState.players.findIndex(p => p._id.toString() === winner._id.toString());
+            takerIndex = (takerIndex + 1) % this.gameState.players.length; // Player to the winner's left
+            
+            const taker = this.gameState.players[takerIndex];
+            const pointsToAdd = GameEngine.getAttackValue(winningTrickPlay.card.rank, winningTrickPlay.card.suit);
+            
+            taker.points += pointsToAdd;
+            console.log(`Player ${taker.username} takes ${pointsToAdd} points. Total points: ${taker.points}`);
+            
+            // Check for elimination
+            if (taker.points >= 12) {
+                this.eliminatePlayer(taker);
+            }
+
+            // Set the next dealer (winner of the trick)
+            this.gameState.players.forEach(p => p.isDealer = false);
+            winner.isDealer = true;
+
+            // Prepare for next round
+            this.gameState.currentTrick = [];
+            this.gameState.lastPlayedCard = null;
+            this.gameState.currentPlayerIndex = this.gameState.players.findIndex(p => p._id.toString() === winner._id.toString());
+            this.updateCurrentPlayer();
+            this.gameState.round++;
+        }
+    }
+
+    // Determine the trick winner based on the rules.txt
+    getTrickWinner() {
+        const callingCard = this.gameState.currentTrick[0].card;
+        let highestRankedCard = callingCard;
+        let winningTrickPlay = this.gameState.currentTrick[0];
+
+        // Filter for cards that followed suit
+        const followingSuitPlays = this.gameState.currentTrick.filter(play => play.card.suit === callingCard.suit);
+
+        // Find the highest ranked card among those that followed suit
+        for (const play of followingSuitPlays) {
+            if (GameEngine.getPlayOrder(play.card.rank) > GameEngine.getPlayOrder(highestRankedCard.rank)) {
+                highestRankedCard = play.card;
+                winningTrickPlay = play;
+            }
+        }
+        return winningTrickPlay;
+    }
+
+    eliminatePlayer(player) {
+        console.log(`Player ${player.username} is eliminated.`);
+        this.gameState.players = this.gameState.players.filter(p => p._id.toString() !== player._id.toString());
+        
+        // If only one player is left, the game is over
+        if (this.gameState.players.length === 1) {
+            this.gameState.status = 'gameOver';
+        }
+        // If the eliminated player was the current one, advance the turn
+        if (this.gameState.currentPlayerIndex >= this.gameState.players.length) {
+            this.gameState.currentPlayerIndex = 0;
+            this.updateCurrentPlayer();
+        }
+    }
+
+    // =========================================================================
+    // AI Logic
+    // =========================================================================
+
+    shouldProcessAITurn() {
+        if (this.gameState.status !== 'playing' || this.gameState.gamePhase !== 'playing') {
+            return false;
+        }
+        const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
+        return currentPlayer?.isAI;
+    }
+
+    processAITurn() {
+        const aiPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
+        console.log(`Processing AI turn for ${aiPlayer.username}...`);
+
+        const lastCard = this.gameState.lastPlayedCard;
+        const validCards = aiPlayer.cards.filter(card => this.isValidCardPlay(card));
+
+        let cardToPlay;
+
+        if (validCards.length > 0) {
+            // Simple AI logic:
+            // 1. Play the highest ranking card of the same suit if available
+            // 2. If no same suit, play any card
+            // 3. For a more advanced AI, add logic for special cards (e.g., A, 3, 4)
+            validCards.sort((a, b) => GameEngine.getPlayOrder(b.rank) - GameEngine.getPlayOrder(a.rank));
+
+            const sameSuitCards = validCards.filter(c => c.suit === lastCard?.suit);
+
+            if (sameSuitCards.length > 0) {
+                // Play the highest rank of the same suit
+                cardToPlay = sameSuitCards[0];
+            } else {
+                // Play a random valid card
+                cardToPlay = validCards[Math.floor(Math.random() * validCards.length)];
+            }
+            
+            // Play the card
+            return this.playCard(aiPlayer._id, cardToPlay.id);
+        } else {
+            // No valid card, draw a card
+            // The `rules.txt` doesn't explicitly mention drawing, but this is a standard behavior.
+            const drawnCard = this.gameState.deck.pop();
+            if (drawnCard) {
+                aiPlayer.cards.push(drawnCard);
+                // Check if the drawn card can be played.
+                if (this.isValidCardPlay(drawnCard)) {
+                    // Play the drawn card immediately
+                    return this.playCard(aiPlayer._id, drawnCard.id);
+                }
+            }
+            // If the drawn card can't be played or no cards to draw, pass the turn.
+            return this.passTurn(aiPlayer._id);
+        }
+    }
+
+    // =========================================================================
+    // Static Deck & Card Methods
+    // =========================================================================
+
+    static createDeck() {
+        const suits = ['♠', '♣', '♥', '♦'];
+        const ranks = ['3', '4', '5', '6', '7', '8', '9', '10', 'A'];
+        const deck = [];
+        let idCounter = 1;
+        
+        suits.forEach(suit => {
+            ranks.forEach(rank => {
+                deck.push({
+                    id: idCounter++,
+                    suit,
+                    rank,
+                    isSpecial: ['A', '4', '3'].includes(rank)
+                });
+            });
+        });
+        return deck;
     }
 
     static getAttackValue(rank, suit) {

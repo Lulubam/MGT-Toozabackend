@@ -1,16 +1,17 @@
+
 // server.js - Fixed Server with Proper AI Management
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
 const Room = require('./models/Room');
 const express = require('express');
-const http = require('./server');
+const http = require('http'); // FIXED: Using built-in http module
 const socketIo = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
 
 const app = express();
-const server = http.createServer(app);
+const server = http.createServer(app); // This will now work
 
 // =========================================================================
 // AI Players Configuration

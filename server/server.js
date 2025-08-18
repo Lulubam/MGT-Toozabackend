@@ -1,5 +1,4 @@
-// server.js
-// Corrected import paths
+// server.js - Fixed Tooza Game Server with Proper Player Sync
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
@@ -9,7 +8,6 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -45,19 +43,20 @@ app.use(cors());
 app.use(express.json());
 
 // =========================================================================
-// API Routes
+// API Routes - Fixed for Better Player Management
 // =========================================================================
 
-// Create a new game room
+// Create a new game room (NO AI players here)
 app.post('/api/create-room', async (req, res) => {
     try {
-        const { playerName, aiPlayers = [] } = req.body;
+        const { playerName } = req.body;
         if (!playerName) {
             return res.status(400).json({ success: false, error: 'Player name is required' });
         }
 
         const roomCode = generateRoomCode();
         
+        // Create room with empty game state initially
         const newRoom = new Room({
             code: roomCode,
             maxPlayers: 4,
@@ -73,26 +72,6 @@ app.post('/api/create-room', async (req, res) => {
         
         newRoom.players.push(player._id);
         
-        const createdPlayers = [player];
-
-        // Create AI players if requested
-        for (const aiKey of aiPlayers) {
-            const aiData = AI_PLAYERS[aiKey];
-            if (aiData) {
-                const newAIPlayer = new Player({
-                    username: aiData.name,
-                    roomCode: roomCode,
-                    isAI: true,
-                    isDealer: false,
-                    aiLevel: aiData.level,
-                    socketId: 'AI_PLAYER' // A special ID to identify AI
-                });
-                await newAIPlayer.save();
-                newRoom.players.push(newAIPlayer._id);
-                createdPlayers.push(newAIPlayer);
-            }
-        }
-
         await newRoom.save();
         await player.save();
 
@@ -127,6 +106,12 @@ app.post('/api/join-room', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Room is full' });
         }
 
+        // Check if player name already exists in room
+        const existingPlayer = room.players.find(p => p.username === playerName);
+        if (existingPlayer) {
+            return res.status(400).json({ success: false, error: 'Player name already taken in this room' });
+        }
+
         const player = new Player({
             username: playerName,
             roomCode: roomCode,
@@ -154,11 +139,11 @@ app.post('/api/join-room', async (req, res) => {
 });
 
 // =========================================================================
-// Socket.IO Logic
+// Socket.IO Logic - Enhanced for Better Sync
 // =========================================================================
 const io = socketIo(server, {
     cors: {
-        origin: 'https://mgt-toozabackend.onrender.com', // Adjust this to your client's URL
+        origin: '*', // Allow all origins for development - restrict in production
         methods: ['GET', 'POST'],
         credentials: true
     }
@@ -166,11 +151,12 @@ const io = socketIo(server, {
 
 // In-memory map for game engine instances
 const gameEngines = {};
+const playerSockets = {}; // Track socket connections per player
 
 io.on('connection', (socket) => {
     console.log(`New client connected: ${socket.id}`);
 
-    // Join a game room with the socket
+    // Join a game room with the socket - FIXED for proper sync
     socket.on('join-game', async ({ playerId, roomCode }) => {
         try {
             const player = await Player.findById(playerId);
@@ -186,28 +172,46 @@ io.on('connection', (socket) => {
             player.lastSeen = new Date();
             await player.save();
 
+            // Track this player's socket connection
+            playerSockets[playerId] = socket.id;
+
             // Join the socket room
             socket.join(roomCode);
-            console.log(`Socket ${socket.id} joined room ${roomCode}`);
+            socket.playerInfo = { playerId, roomCode, playerName: player.username };
+            console.log(`Socket ${socket.id} (${player.username}) joined room ${roomCode}`);
 
-            // Instantiate or get the game engine for the room
+            // Initialize or get game engine
             if (!gameEngines[roomCode]) {
                 gameEngines[roomCode] = new GameEngine(roomCode);
-                gameEngines[roomCode].gameState = room.gameState;
+                // Load existing game state from database if it exists
+                if (room.gameState && Object.keys(room.gameState).length > 0) {
+                    gameEngines[roomCode].gameState = room.gameState;
+                }
             }
 
-            // Update game state with live players
+            // Update game state with ALL players from database
             gameEngines[roomCode].updatePlayers(room.players);
             
-            // Broadcast the updated game state to all players in the room
+            // Broadcast the updated game state to ALL players in the room
             const currentGameState = gameEngines[roomCode].getGameState();
+            console.log(`Broadcasting game state to room ${roomCode}:`, {
+                playerCount: currentGameState.players.length,
+                status: currentGameState.status,
+                phase: currentGameState.gamePhase
+            });
+            
             io.to(roomCode).emit('game-state', currentGameState);
-            io.to(roomCode).emit('player-joined', { username: player.username });
+            io.to(roomCode).emit('player-joined', { 
+                username: player.username,
+                totalPlayers: room.players.length 
+            });
 
-            // Check if an AI needs to play after a player joins
-            if (currentGameState.status === 'playing') {
-                checkAndProcessAITurn(roomCode);
-            }
+            // Auto-process AI turn if needed
+            setTimeout(() => {
+                if (currentGameState.status === 'playing') {
+                    processAITurnChain(roomCode);
+                }
+            }, 1000);
 
         } catch (error) {
             console.error('Error in join-game:', error);
@@ -215,7 +219,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Handle game actions
+    // Handle game actions - ENHANCED
     socket.on('game-action', async ({ action, data }) => {
         try {
             const player = await Player.findOne({ socketId: socket.id });
@@ -229,6 +233,8 @@ io.on('connection', (socket) => {
                 return socket.emit('error', { message: 'Game not found.' });
             }
 
+            console.log(`Processing action '${action}' from ${player.username} in room ${roomCode}`, data);
+
             // Handle the action
             const result = gameEngine.handleAction(action, player._id, data);
             
@@ -240,15 +246,29 @@ io.on('connection', (socket) => {
                     { new: true, populate: 'players' }
                 );
                 
-                // Emit the new game state to all players in the room
-                io.to(roomCode).emit('game-state', room.gameState);
-
-                // If the game is still playing, check and process AI turn
-                if (room.gameState.status === 'playing') {
-                    checkAndProcessAITurn(roomCode);
+                // Broadcast to ALL sockets in the room
+                const gameState = gameEngine.getGameState();
+                console.log(`Broadcasting updated game state after ${action}:`, {
+                    currentPlayer: gameState.players[gameState.currentPlayerIndex]?.username,
+                    status: gameState.status,
+                    phase: gameState.gamePhase
+                });
+                
+                io.to(roomCode).emit('game-state', gameState);
+                
+                if (result.message) {
+                    io.to(roomCode).emit('game-message', { message: result.message });
                 }
 
+                // Process AI turns in sequence
+                setTimeout(() => {
+                    if (gameState.status === 'playing' && gameState.gamePhase === 'playing') {
+                        processAITurnChain(roomCode);
+                    }
+                }, 500);
+
             } else {
+                console.log(`Action failed: ${result.error}`);
                 socket.emit('error', { message: result.error });
             }
 
@@ -258,14 +278,64 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Player leaves room
+    // Handle AI player management
+    socket.on('manage-ai', async ({ action, aiKey }) => {
+        try {
+            const player = await Player.findOne({ socketId: socket.id });
+            if (!player) {
+                return socket.emit('error', { message: 'Player not found.' });
+            }
+
+            const roomCode = player.roomCode;
+            const gameEngine = gameEngines[roomCode];
+            if (!gameEngine) {
+                return socket.emit('error', { message: 'Game not found.' });
+            }
+
+            let result;
+            if (action === 'add') {
+                result = gameEngine.addAIPlayer(aiKey);
+            } else if (action === 'remove') {
+                result = gameEngine.removeAIPlayer(aiKey);
+            } else {
+                return socket.emit('error', { message: 'Invalid AI action.' });
+            }
+
+            if (result.success) {
+                // Update database and broadcast
+                const room = await Room.findOneAndUpdate(
+                    { code: roomCode },
+                    { gameState: gameEngine.getGameState() },
+                    { new: true, populate: 'players' }
+                );
+                
+                io.to(roomCode).emit('game-state', gameEngine.getGameState());
+                io.to(roomCode).emit('game-message', { message: result.message });
+            } else {
+                socket.emit('error', { message: result.error });
+            }
+
+        } catch (error) {
+            console.error('Error managing AI:', error);
+            socket.emit('error', { message: 'Failed to manage AI player.' });
+        }
+    });
+
+    // Player leaves room - ENHANCED
     socket.on('leave-room', async ({ playerId, roomCode }) => {
         try {
             const room = await Room.findOne({ code: roomCode });
             if (!room) return;
 
-            // Remove player from the room
+            // Remove player from database
             await Player.findByIdAndDelete(playerId);
+            
+            // Remove from socket tracking
+            delete playerSockets[playerId];
+
+            // Update room's player list
+            room.players = room.players.filter(p => p.toString() !== playerId);
+            await room.save();
 
             // Reload players to get the updated list
             const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
@@ -274,9 +344,12 @@ io.on('connection', (socket) => {
             if (gameEngines[roomCode]) {
                 gameEngines[roomCode].updatePlayers(updatedRoom.players);
                 io.to(roomCode).emit('game-state', gameEngines[roomCode].getGameState());
+                io.to(roomCode).emit('game-message', { 
+                    message: `Player left the game. ${updatedRoom.players.length} players remaining.` 
+                });
             }
 
-            // If the room is now empty, clean it up
+            // Clean up empty rooms
             if (updatedRoom.players.length === 0) {
                 delete gameEngines[roomCode];
                 await Room.findByIdAndDelete(updatedRoom._id);
@@ -290,23 +363,116 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', async () => {
         console.log(`Client disconnected: ${socket.id}`);
-        // Find player by socketId
-        const player = await Player.findOneAndUpdate(
-            { socketId: socket.id },
-            { isActive: false, socketId: null, lastSeen: new Date() }
-        );
+        
+        try {
+            // Find and update player status
+            const player = await Player.findOneAndUpdate(
+                { socketId: socket.id },
+                { isActive: false, socketId: null, lastSeen: new Date() }
+            );
 
-        if (player) {
-            // Find the room and update its game state
-            const room = await Room.findOne({ code: player.roomCode }).populate('players');
-            if (room && gameEngines[room.code]) {
-                gameEngines[room.code].updatePlayers(room.players);
-                // Broadcast to remaining players
-                io.to(room.code).emit('game-state', gameEngines[room.code].getGameState());
+            if (player && socket.playerInfo) {
+                const { roomCode } = socket.playerInfo;
+                
+                // Remove from socket tracking
+                delete playerSockets[player._id];
+                
+                // Update game state if room still exists
+                const room = await Room.findOne({ code: roomCode }).populate('players');
+                if (room && gameEngines[roomCode]) {
+                    gameEngines[roomCode].updatePlayers(room.players);
+                    io.to(roomCode).emit('game-state', gameEngines[roomCode].getGameState());
+                }
             }
+        } catch (error) {
+            console.error('Error handling disconnect:', error);
         }
     });
 });
+
+// =========================================================================
+// Enhanced AI Processing Functions
+// =========================================================================
+
+// Process AI turns in sequence to avoid conflicts
+async function processAITurnChain(roomCode, maxDepth = 10, currentDepth = 0) {
+    if (currentDepth >= maxDepth) {
+        console.log(`Max AI turn depth reached for room ${roomCode}`);
+        return;
+    }
+
+    const gameEngine = gameEngines[roomCode];
+    if (!gameEngine || !gameEngine.shouldProcessAITurn()) {
+        return;
+    }
+
+    const currentPlayer = gameEngine.gameState.players[gameEngine.gameState.currentPlayerIndex];
+    console.log(`AI Turn Chain - Processing turn for ${currentPlayer.username} (depth: ${currentDepth})`);
+
+    try {
+        // Add realistic delay for AI thinking
+        const delay = getAIDelay(currentPlayer.aiLevel);
+        
+        setTimeout(async () => {
+            const result = gameEngine.processAITurn();
+            
+            if (result.success) {
+                // Update database
+                const room = await Room.findOneAndUpdate(
+                    { code: roomCode },
+                    { gameState: gameEngine.getGameState() },
+                    { new: true, populate: 'players' }
+                );
+                
+                // Broadcast the updated state
+                const gameState = gameEngine.getGameState();
+                io.to(roomCode).emit('game-state', gameState);
+                
+                if (result.message) {
+                    io.to(roomCode).emit('game-message', { message: result.message });
+                }
+
+                // Check if game ended
+                if (result.gameOver) {
+                    io.to(roomCode).emit('game-over', { 
+                        winner: result.gameWinner,
+                        message: result.message 
+                    });
+                    return;
+                }
+
+                // Continue AI chain if next player is also AI
+                setTimeout(() => {
+                    processAITurnChain(roomCode, maxDepth, currentDepth + 1);
+                }, 500);
+                
+            } else {
+                console.error(`AI turn failed for ${currentPlayer.username}:`, result.error);
+                io.to(roomCode).emit('game-message', { 
+                    message: `${currentPlayer.username} encountered an error and skipped their turn.` 
+                });
+                
+                // Skip to next player
+                gameEngine.nextPlayer();
+                setTimeout(() => {
+                    processAITurnChain(roomCode, maxDepth, currentDepth + 1);
+                }, 1000);
+            }
+        }, delay);
+        
+    } catch (error) {
+        console.error(`Error in AI turn chain for room ${roomCode}:`, error);
+    }
+}
+
+function getAIDelay(aiLevel) {
+    switch(aiLevel) {
+        case 'beginner': return Math.random() * 2000 + 1000; // 1-3 seconds
+        case 'intermediate': return Math.random() * 1500 + 1500; // 1.5-3 seconds  
+        case 'advanced': return Math.random() * 1000 + 2000; // 2-3 seconds
+        default: return 1500;
+    }
+}
 
 // =========================================================================
 // Utility Functions
@@ -315,57 +481,41 @@ function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
 }
 
-async function checkAndProcessAITurn(roomCode) {
-    const gameEngine = gameEngines[roomCode];
-    if (!gameEngine || !gameEngine.shouldProcessAITurn()) {
-        return;
-    }
-
-    // Delay the AI's turn to make it feel more natural
-    const delay = Math.floor(Math.random() * 2000) + 1000; // 1 to 3 seconds
-    setTimeout(async () => {
-        const result = gameEngine.processAITurn();
-        if (result.success) {
-            // Update the database and broadcast the new state
-            const room = await Room.findOneAndUpdate(
-                { code: roomCode },
-                { gameState: gameEngine.getGameState() },
-                { new: true, populate: 'players' }
-            );
-            
-            io.to(roomCode).emit('game-state', room.gameState);
-
-            // After the AI plays, check if the next player is also an AI
-            checkAndProcessAITurn(roomCode);
-        } else {
-            console.error('AI turn failed:', result.error);
-        }
-    }, delay);
-}
-
 // =========================================================================
-// Cleanup Routine (for stale players and rooms)
+// Enhanced Cleanup Routine
 // =========================================================================
 setInterval(async () => {
     try {
-        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         
-        // Delete inactive human players (not AI players)
-        await Player.deleteMany({ 
-            socketId: { $ne: 'AI_PLAYER' },
-            socketId: null,
-            updatedAt: { $lt: oneDayAgo } 
+        // Delete inactive human players (keep AI players that are in active rooms)
+        const inactiveHumanPlayers = await Player.find({ 
+            isAI: false,
+            $or: [
+                { socketId: null, updatedAt: { $lt: oneDayAgo } },
+                { isActive: false, updatedAt: { $lt: oneDayAgo } }
+            ]
         });
         
-        // Delete empty rooms
-        const emptyRooms = await Room.find({ players: { $size: 0 } });
-        for (const room of emptyRooms) {
-            // Also clean up any remaining AI players in empty rooms
-            await Player.deleteMany({ roomCode: room.code });
-            await Room.findByIdAndDelete(room._id);
+        for (const player of inactiveHumanPlayers) {
+            await Player.findByIdAndDelete(player._id);
+            
+            // Clean up AI players in empty rooms
+            const room = await Room.findOne({ code: player.roomCode }).populate('players');
+            if (room) {
+                room.players = room.players.filter(p => p._id.toString() !== player._id.toString());
+                if (room.players.length === 0) {
+                    await Player.deleteMany({ roomCode: player.roomCode, isAI: true });
+                    await Room.findByIdAndDelete(room._id);
+                    delete gameEngines[player.roomCode];
+                    console.log(`Cleaned up empty room: ${player.roomCode}`);
+                } else {
+                    await room.save();
+                }
+            }
         }
         
-        console.log('Cleaned up stale data');
+        console.log(`Cleanup completed - removed ${inactiveHumanPlayers.length} inactive players`);
     } catch (err) {
         console.error('Cleanup error:', err);
     }
@@ -376,22 +526,24 @@ app.get('/health', (req, res) => {
     res.status(200).json({ 
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        activeRooms: Object.keys(gameEngines).length
     });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({ 
-        message: 'Whot! Game Server is running',
+        message: 'Tooza Card Game Server is running!',
         features: [
             'Create/Join rooms',
-            'AI players (Otu, Ase, Dede, Ogbologbo, Agba)',
-            'Real-time multiplayer',
-            'Leave room functionality'
+            'Add/Remove AI players in-game',
+            'Real-time multiplayer with proper synchronization', 
+            'Tooza game rules implementation',
+            'Advanced AI with different difficulty levels'
         ]
     });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Tooza Game Server running on port ${PORT}`));

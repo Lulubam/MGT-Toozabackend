@@ -1,4 +1,4 @@
-// game/GameEngine.js - Tooza Card Game Engine with Proper Rules
+// game/GameEngine.js - Correct Trick-Taking Game Engine
 
 class GameEngine {
     constructor(roomCode) {
@@ -10,13 +10,14 @@ class GameEngine {
             trickHistory: [],
             gamePhase: 'waiting', // waiting, dealing, playing, roundEnd
             deck: [],
-            discardPile: [],
             round: 1,
             currentPlayerIndex: 0,
-            lastPlayedCard: null,
-            gameDirection: 1, // 1 for clockwise, -1 for counter-clockwise
+            dealerIndex: 0,
+            callingSuit: null, // The suit that must be followed in current trick
+            trickLeader: null, // Who started the current trick
             trickWinner: null,
-            roundWinner: null
+            gameDirection: 1, // Always clockwise in this game
+            finalTrickWinner: null
         };
     }
 
@@ -39,10 +40,6 @@ class GameEngine {
                     return this.dealCards();
                 case 'joinGame':
                     return this.joinGame(playerId);
-                case 'drawCard':
-                    return this.drawCard(playerId);
-                case 'pass':
-                    return this.passTurn(playerId);
                 case 'addAI':
                     return this.addAIPlayer(data.aiKey);
                 case 'removeAI':
@@ -68,14 +65,15 @@ class GameEngine {
                 cards: existingPlayer?.cards || [],
                 points: existingPlayer?.points || 0,
                 isCurrent: existingPlayer?.isCurrent || false,
-                isDealer: existingPlayer?.isDealer || false
+                isDealer: existingPlayer?.isDealer || false,
+                isEliminated: existingPlayer?.isEliminated || false
             };
         });
         
         // Ensure proper current player assignment
         if (this.gameState.players.length > 0) {
             const hasCurrentPlayer = this.gameState.players.some(p => p.isCurrent);
-            if (!hasCurrentPlayer) {
+            if (!hasCurrentPlayer && this.gameState.status === 'playing') {
                 if (this.gameState.currentPlayerIndex < this.gameState.players.length) {
                     this.gameState.players[this.gameState.currentPlayerIndex].isCurrent = true;
                 } else {
@@ -127,6 +125,7 @@ class GameEngine {
             isDealer: false,
             isCurrent: false,
             isActive: true,
+            isEliminated: false,
             socketId: 'AI_PLAYER'
         };
 
@@ -163,17 +162,19 @@ class GameEngine {
         if (this.gameState.currentPlayerIndex >= aiIndex && this.gameState.currentPlayerIndex > 0) {
             this.gameState.currentPlayerIndex--;
         }
+        if (this.gameState.dealerIndex >= aiIndex && this.gameState.dealerIndex > 0) {
+            this.gameState.dealerIndex--;
+        }
         this.updateCurrentPlayer();
 
         return { success: true, message: `${aiName} left the game` };
     }
 
     // =========================================================================
-    // Game Flow Methods - Updated for Tooza Rules
+    // Game Flow Methods - Correct Trick-Taking Rules
     // =========================================================================
 
     startGame(playerId) {
-        // Find the player who wants to start the game
         const player = this.gameState.players.find(p => 
             (p._id && p._id.toString()) === (playerId && playerId.toString())
         );
@@ -186,45 +187,83 @@ class GameEngine {
             return { success: false, error: 'Need at least 2 players to start.' };
         }
         
-        // Set first player as dealer
+        // Initialize all players
         this.gameState.players.forEach((p, index) => {
-            p.isDealer = index === 0;
             p.points = 0;
             p.cards = [];
+            p.isEliminated = false;
+            p.isDealer = false;
+            p.isCurrent = false;
         });
 
+        // Select initial dealer by highest card draw
+        this.selectInitialDealer();
+        
         this.gameState.status = 'playing';
         this.gameState.gamePhase = 'dealing';
-        this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createToozaDeck());
-        this.gameState.discardPile = [];
         this.dealCards();
         
-        return { success: true, message: 'Game started!' };
+        return { success: true, message: 'Game started! Dealer selected by highest card draw.' };
+    }
+
+    selectInitialDealer() {
+        // Each player draws one card to determine dealer
+        const tempDeck = GameEngine.shuffleDeck(GameEngine.createStandardDeck());
+        const draws = [];
+        
+        this.gameState.players.forEach((player, index) => {
+            const drawnCard = tempDeck.pop();
+            draws.push({ player, card: drawnCard, index });
+        });
+        
+        // Find highest card (Ace > 10 > 9 > 8 > 7 > 6 > 5 > 4 > 3)
+        const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+        const highestDraw = draws.reduce((max, current) => {
+            const maxRank = cardRanks[max.card.rank] || 0;
+            const currentRank = cardRanks[current.card.rank] || 0;
+            return currentRank > maxRank ? current : max;
+        });
+        
+        this.gameState.dealerIndex = highestDraw.index;
+        this.gameState.players[this.gameState.dealerIndex].isDealer = true;
+        
+        console.log(`${highestDraw.player.username} is the dealer with ${highestDraw.card.rank} of ${highestDraw.card.suit}`);
     }
 
     dealCards() {
-        // Deal 5 cards to each player (standard Tooza)
-        for (let i = 0; i < 5; i++) {
-            this.gameState.players.forEach(player => {
+        this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createStandardDeck());
+        
+        // First phase: Deal 3 cards to each player
+        for (let i = 0; i < 3; i++) {
+            let currentIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
+            for (let j = 0; j < this.gameState.players.length; j++) {
                 if (this.gameState.deck.length > 0) {
-                    player.cards.push(this.gameState.deck.pop());
+                    this.gameState.players[currentIndex].cards.push(this.gameState.deck.pop());
                 }
-            });
+                currentIndex = (currentIndex + 1) % this.gameState.players.length;
+            }
+        }
+        
+        // Second phase: Deal 2 more cards to each player
+        for (let i = 0; i < 2; i++) {
+            let currentIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
+            for (let j = 0; j < this.gameState.players.length; j++) {
+                if (this.gameState.deck.length > 0) {
+                    this.gameState.players[currentIndex].cards.push(this.gameState.deck.pop());
+                }
+                currentIndex = (currentIndex + 1) % this.gameState.players.length;
+            }
         }
 
-        // Place first card on discard pile
-        if (this.gameState.deck.length > 0) {
-            this.gameState.discardPile.push(this.gameState.deck.pop());
-            this.gameState.lastPlayedCard = this.gameState.discardPile[this.gameState.discardPile.length - 1];
-        }
-
-        // Set first player (left of dealer)
-        const dealerIndex = this.gameState.players.findIndex(p => p.isDealer);
-        this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
+        // Start first trick - player left of dealer leads
+        this.gameState.currentPlayerIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
+        this.gameState.trickLeader = this.gameState.currentPlayerIndex;
         this.updateCurrentPlayer();
         this.gameState.gamePhase = 'playing';
+        this.gameState.currentTrick = [];
+        this.gameState.callingSuit = null;
         
-        return { success: true, message: 'Cards dealt. Game begins!' };
+        return { success: true, message: 'Cards dealt. First player leads!' };
     }
 
     playCard(playerId, cardId) {
@@ -241,104 +280,204 @@ class GameEngine {
 
         const cardToPlay = currentPlayer.cards[cardToPlayIndex];
 
-        if (!this.isValidToozaPlay(cardToPlay)) {
-            return { success: false, error: 'Invalid card play. Must match suit or rank.' };
+        // Check if play is valid
+        const validationResult = this.isValidPlay(cardToPlay, currentPlayer);
+        if (!validationResult.valid) {
+            // If invalid and player has cards of calling suit, it's a foul
+            if (this.gameState.callingSuit && this.hasCardOfSuit(currentPlayer, this.gameState.callingSuit)) {
+                currentPlayer.points += 2;
+                return { success: false, error: `${validationResult.error} - 2 point foul for failing to follow suit!` };
+            }
+            return { success: false, error: validationResult.error };
         }
 
-        // Remove card from player's hand and add to discard pile
+        // Remove card from player's hand
         currentPlayer.cards.splice(cardToPlayIndex, 1);
-        this.gameState.discardPile.push(cardToPlay);
-        this.gameState.lastPlayedCard = cardToPlay;
-
-        // Handle special cards
-        this.handleSpecialCard(cardToPlay, currentPlayer);
-
-        // Check if player won the round
-        if (currentPlayer.cards.length === 0) {
-            return this.endRound(currentPlayer);
-        }
-
-        // Move to next player (unless direction was changed by special card)
-        this.nextPlayer();
-        return { success: true, message: `${currentPlayer.username} played ${cardToPlay.rank} of ${cardToPlay.suit}` };
-    }
-
-    isValidToozaPlay(card) {
-        if (!this.gameState.lastPlayedCard) {
-            return true; // First card can be anything
-        }
-
-        const lastCard = this.gameState.lastPlayedCard;
         
-        // Must match either suit or rank
-        return card.suit === lastCard.suit || card.rank === lastCard.rank;
-    }
+        // Add to current trick
+        this.gameState.currentTrick.push({
+            player: currentPlayer,
+            card: cardToPlay,
+            playerId: currentPlayer._id
+        });
 
-    handleSpecialCard(card, player) {
-        switch(card.rank) {
-            case 'A': // Ace - Reverse direction
-                this.gameState.gameDirection *= -1;
-                break;
-            case '2': // Two - Next player draws 2 cards
-                const nextIndex = this.getNextPlayerIndex();
-                const nextPlayer = this.gameState.players[nextIndex];
-                this.drawCards(nextPlayer, 2);
-                // Skip the next player's turn
-                this.gameState.currentPlayerIndex = this.getNextPlayerIndex(nextIndex);
-                break;
-            case '8': // Eight - Skip next player
-                this.gameState.currentPlayerIndex = this.getNextPlayerIndex();
-                break;
-            case 'J': // Jack - Player can play again
-                // Don't advance turn - same player plays again
-                return;
-            case 'K': // King - All other players draw 1 card
-                this.gameState.players.forEach(p => {
-                    if (p._id !== player._id) {
-                        this.drawCards(p, 1);
-                    }
-                });
-                break;
+        // If this is the first card of the trick, set calling suit
+        if (this.gameState.currentTrick.length === 1) {
+            this.gameState.callingSuit = cardToPlay.suit;
+        }
+
+        // Check if trick is complete
+        const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+        if (this.gameState.currentTrick.length === activePlayers.length) {
+            return this.completeTrick();
+        } else {
+            // Move to next player
+            this.nextPlayer();
+            return { success: true, message: `${currentPlayer.username} played ${cardToPlay.rank} of ${cardToPlay.suit}` };
         }
     }
 
-    drawCards(player, count) {
-        for (let i = 0; i < count && this.gameState.deck.length > 0; i++) {
-            player.cards.push(this.gameState.deck.pop());
+    isValidPlay(card, player) {
+        // If no calling suit set, any card is valid (first card of trick)
+        if (!this.gameState.callingSuit) {
+            return { valid: true };
         }
+
+        // Must follow suit if possible
+        if (card.suit === this.gameState.callingSuit) {
+            return { valid: true };
+        }
+
+        // Can play any card if no cards of calling suit
+        if (!this.hasCardOfSuit(player, this.gameState.callingSuit)) {
+            return { valid: true };
+        }
+
+        return { valid: false, error: 'Must follow suit when possible' };
+    }
+
+    hasCardOfSuit(player, suit) {
+        return player.cards.some(card => card.suit === suit);
+    }
+
+    completeTrick() {
+        // Determine trick winner
+        const trickWinner = this.determineTrickWinner();
+        this.gameState.trickWinner = trickWinner.player;
         
-        // If deck is empty, reshuffle discard pile (except top card)
-        if (this.gameState.deck.length === 0 && this.gameState.discardPile.length > 1) {
-            const topCard = this.gameState.discardPile.pop();
-            this.gameState.deck = GameEngine.shuffleDeck(this.gameState.discardPile);
-            this.gameState.discardPile = [topCard];
+        // Add trick to history
+        this.gameState.trickHistory.push([...this.gameState.currentTrick]);
+        
+        // Clear current trick
+        this.gameState.currentTrick = [];
+        this.gameState.callingSuit = null;
+
+        // Check if round is over (5 tricks played)
+        if (this.gameState.trickHistory.length === 5) {
+            return this.endRound();
+        } else {
+            // Winner leads next trick
+            this.gameState.currentPlayerIndex = this.gameState.players.findIndex(p => p._id === trickWinner.player._id);
+            this.gameState.trickLeader = this.gameState.currentPlayerIndex;
+            this.updateCurrentPlayer();
+            
+            return { 
+                success: true, 
+                message: `${trickWinner.player.username} wins trick with ${trickWinner.card.rank} of ${trickWinner.card.suit}! Leading next trick.` 
+            };
         }
     }
 
-    drawCard(playerId) {
-        const player = this.gameState.players.find(p => 
-            (p._id && p._id.toString()) === (playerId && playerId.toString())
+    determineTrickWinner() {
+        const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+        
+        // Only cards of calling suit can win
+        const validCards = this.gameState.currentTrick.filter(play => 
+            play.card.suit === this.gameState.callingSuit
         );
         
-        if (!player) {
-            return { success: false, error: 'Player not found' };
+        if (validCards.length === 0) {
+            // No one followed suit? First card wins
+            return this.gameState.currentTrick[0];
         }
-
-        if (this.gameState.deck.length === 0) {
-            return { success: false, error: 'No more cards to draw' };
-        }
-
-        this.drawCards(player, 1);
-        return { success: true, message: 'Card drawn' };
+        
+        // Find highest rank among valid cards
+        return validCards.reduce((highest, current) => {
+            const highestRank = cardRanks[highest.card.rank] || 0;
+            const currentRank = cardRanks[current.card.rank] || 0;
+            return currentRank > highestRank ? current : highest;
+        });
     }
 
-    getNextPlayerIndex(fromIndex = this.gameState.currentPlayerIndex) {
-        const playerCount = this.gameState.players.length;
-        return (fromIndex + this.gameState.gameDirection + playerCount) % playerCount;
+    endRound() {
+        this.gameState.gamePhase = 'roundEnd';
+        
+        // Final trick winner
+        this.gameState.finalTrickWinner = this.gameState.trickWinner;
+        
+        // Player next to final trick winner takes points
+        const finalWinnerIndex = this.gameState.players.findIndex(p => p._id === this.gameState.finalTrickWinner._id);
+        const penalizedPlayerIndex = (finalWinnerIndex + 1) % this.gameState.players.length;
+        const penalizedPlayer = this.gameState.players[penalizedPlayerIndex];
+        
+        // Points = card value of winning card from final trick
+        const finalTrick = this.gameState.trickHistory[this.gameState.trickHistory.length - 1];
+        const winningCard = finalTrick.find(play => play.player._id === this.gameState.finalTrickWinner._id).card;
+        const pointsToAdd = this.getCardPoints(winningCard);
+        
+        penalizedPlayer.points += pointsToAdd;
+        
+        // Check for elimination (12+ points)
+        const eliminatedPlayers = this.gameState.players.filter(p => p.points >= 12 && !p.isEliminated);
+        eliminatedPlayers.forEach(p => p.isEliminated = true);
+        
+        const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+        
+        if (activePlayers.length <= 1) {
+            // Game over
+            this.gameState.status = 'gameOver';
+            const winner = activePlayers[0] || this.gameState.players.reduce((min, p) => p.points < min.points ? p : min);
+            return {
+                success: true,
+                message: `Game Over! ${winner.username} wins! ${penalizedPlayer.username} took ${pointsToAdd} points from final trick.`,
+                gameOver: true,
+                gameWinner: winner
+            };
+        } else {
+            // Continue to next round
+            this.prepareNextRound();
+            return {
+                success: true,
+                message: `Round ${this.gameState.round} complete! ${penalizedPlayer.username} took ${pointsToAdd} points. ${eliminatedPlayers.length ? `${eliminatedPlayers.map(p => p.username).join(', ')} eliminated!` : ''}`
+            };
+        }
+    }
+
+    prepareNextRound() {
+        this.gameState.round++;
+        this.gameState.gamePhase = 'dealing';
+        this.gameState.trickHistory = [];
+        this.gameState.currentTrick = [];
+        this.gameState.callingSuit = null;
+        this.gameState.trickWinner = null;
+        this.gameState.finalTrickWinner = null;
+        
+        // Rotate dealer to next active player
+        do {
+            this.gameState.dealerIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
+        } while (this.gameState.players[this.gameState.dealerIndex].isEliminated);
+        
+        // Update dealer status
+        this.gameState.players.forEach((p, i) => {
+            p.isDealer = (i === this.gameState.dealerIndex);
+            p.cards = [];
+        });
+        
+        this.dealCards();
+    }
+
+    getCardPoints(card) {
+        // Card values for scoring
+        if (card.rank === '3' && card.suit === '♠') {
+            return 12; // Black 3
+        }
+        if (card.rank === '3') {
+            return 6; // Other 3s
+        }
+        if (card.rank === '4') {
+            return 4;
+        }
+        if (card.rank === 'A') {
+            return 2;
+        }
+        return 1; // All other cards
     }
 
     nextPlayer() {
-        this.gameState.currentPlayerIndex = this.getNextPlayerIndex();
+        do {
+            this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
+        } while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated);
+        
         this.updateCurrentPlayer();
     }
 
@@ -348,82 +487,8 @@ class GameEngine {
         });
     }
 
-    endRound(winner) {
-        this.gameState.gamePhase = 'roundEnd';
-        this.gameState.roundWinner = winner;
-        
-        // Calculate points for remaining players
-        this.gameState.players.forEach(player => {
-            if (player._id !== winner._id) {
-                const cardPoints = player.cards.reduce((sum, card) => {
-                    return sum + this.getCardPoints(card);
-                }, 0);
-                player.points += cardPoints;
-            }
-        });
-
-        // Check for game over (someone reaches 100 points or more)
-        const eliminatedPlayers = this.gameState.players.filter(p => p.points >= 100);
-        if (eliminatedPlayers.length > 0) {
-            this.gameState.status = 'gameOver';
-            // Winner is player with lowest points
-            const gameWinner = this.gameState.players.reduce((min, player) => 
-                player.points < min.points ? player : min
-            );
-            return { 
-                success: true, 
-                message: `Round won by ${winner.username}! Game won by ${gameWinner.username}!`,
-                gameOver: true,
-                gameWinner: gameWinner
-            };
-        } else {
-            // Start new round
-            this.gameState.round++;
-            this.prepareNewRound();
-            return { 
-                success: true, 
-                message: `Round ${this.gameState.round - 1} won by ${winner.username}! Starting new round.`
-            };
-        }
-    }
-
-    prepareNewRound() {
-        // Reset for new round
-        this.gameState.gamePhase = 'dealing';
-        this.gameState.deck = GameEngine.shuffleDeck(GameEngine.createToozaDeck());
-        this.gameState.discardPile = [];
-        this.gameState.lastPlayedCard = null;
-        this.gameState.gameDirection = 1;
-        
-        // Clear all cards
-        this.gameState.players.forEach(player => {
-            player.cards = [];
-        });
-        
-        // Rotate dealer
-        const currentDealerIndex = this.gameState.players.findIndex(p => p.isDealer);
-        this.gameState.players[currentDealerIndex].isDealer = false;
-        const newDealerIndex = (currentDealerIndex + 1) % this.gameState.players.length;
-        this.gameState.players[newDealerIndex].isDealer = true;
-        
-        this.dealCards();
-    }
-
-    getCardPoints(card) {
-        // Point values for Tooza
-        switch(card.rank) {
-            case 'A': return 15;
-            case 'K': return 10;
-            case 'Q': return 10;
-            case 'J': return 10;
-            case '2': return 20; // Draw 2 card
-            case '8': return 50; // Skip card
-            default: return parseInt(card.rank) || 0;
-        }
-    }
-
     // =========================================================================
-    // AI Logic - Enhanced
+    // AI Logic - For Trick-Taking Game
     // =========================================================================
 
     shouldProcessAITurn() {
@@ -431,7 +496,7 @@ class GameEngine {
             return false;
         }
         const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
-        return currentPlayer?.isAI && currentPlayer?.isActive;
+        return currentPlayer?.isAI && currentPlayer?.isActive && !currentPlayer?.isEliminated;
     }
 
     processAITurn() {
@@ -442,99 +507,114 @@ class GameEngine {
 
         console.log(`Processing AI turn for ${aiPlayer.username} (${aiPlayer.aiLevel})...`);
 
-        const validCards = aiPlayer.cards.filter(card => this.isValidToozaPlay(card));
-
-        if (validCards.length > 0) {
-            let cardToPlay = this.selectAICard(aiPlayer, validCards);
-            return this.playCard(aiPlayer._id, cardToPlay.id);
-        } else {
-            // Must draw a card
-            const drawResult = this.drawCard(aiPlayer._id);
-            if (drawResult.success) {
-                // Check if drawn card can be played
-                const drawnCard = aiPlayer.cards[aiPlayer.cards.length - 1];
-                if (this.isValidToozaPlay(drawnCard)) {
-                    // AI can choose to play it or pass
-                    if (aiPlayer.aiLevel === 'advanced' && Math.random() > 0.3) {
-                        return this.playCard(aiPlayer._id, drawnCard.id);
-                    }
-                }
-            }
-            // Pass turn
-            this.nextPlayer();
-            return { success: true, message: `${aiPlayer.username} drew a card and passed` };
-        }
+        const cardToPlay = this.selectAICard(aiPlayer);
+        return this.playCard(aiPlayer._id, cardToPlay.id);
     }
 
-    selectAICard(aiPlayer, validCards) {
-        const lastCard = this.gameState.lastPlayedCard;
+    selectAICard(aiPlayer) {
+        const callingSuit = this.gameState.callingSuit;
         
-        switch(aiPlayer.aiLevel) {
+        if (callingSuit) {
+            // Must follow suit if possible
+            const suitCards = aiPlayer.cards.filter(card => card.suit === callingSuit);
+            if (suitCards.length > 0) {
+                return this.chooseFromSuitCards(suitCards, aiPlayer.aiLevel);
+            }
+        }
+        
+        // Can play any card
+        return this.chooseFromAnyCards(aiPlayer.cards, aiPlayer.aiLevel);
+    }
+
+    chooseFromSuitCards(suitCards, aiLevel) {
+        const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+        
+        switch(aiLevel) {
             case 'beginner':
-                // Play first valid card
-                return validCards[0];
+                // Play random card of suit
+                return suitCards[Math.floor(Math.random() * suitCards.length)];
                 
             case 'intermediate':
-                // Prefer special cards, then matching rank over suit
-                const specialCards = validCards.filter(card => 
-                    ['A', '2', '8', 'J', 'K'].includes(card.rank)
-                );
-                if (specialCards.length > 0) {
-                    return specialCards[0];
+                // Try to win trick if first player, otherwise play low
+                if (this.gameState.currentTrick.length === 0) {
+                    return suitCards.reduce((max, card) => {
+                        return (cardRanks[card.rank] || 0) > (cardRanks[max.rank] || 0) ? card : max;
+                    });
+                } else {
+                    return suitCards.reduce((min, card) => {
+                        return (cardRanks[card.rank] || 0) < (cardRanks[min.rank] || 0) ? card : min;
+                    });
                 }
-                
-                const rankMatches = validCards.filter(card => card.rank === lastCard.rank);
-                if (rankMatches.length > 0) {
-                    return rankMatches[0];
-                }
-                return validCards[0];
                 
             case 'advanced':
-                // Strategic play - consider hand size, special cards, and opponent disruption
-                const handSize = aiPlayer.cards.length;
-                
-                // If close to winning, play high-value cards first
-                if (handSize <= 3) {
-                    const highValueCards = validCards.filter(card => 
-                        ['A', 'K', 'Q', 'J', '2', '8'].includes(card.rank)
-                    );
-                    if (highValueCards.length > 0) {
-                        return highValueCards[0];
+                // Strategic play based on trick position and card tracking
+                if (this.gameState.currentTrick.length === 0) {
+                    // Leading - play mid-range card
+                    suitCards.sort((a, b) => (cardRanks[a.rank] || 0) - (cardRanks[b.rank] || 0));
+                    return suitCards[Math.floor(suitCards.length / 2)];
+                } else {
+                    // Following - try to win if can with low card, else play lowest
+                    const currentWinning = this.getCurrentTrickWinner();
+                    const winningRank = cardRanks[currentWinning.card.rank] || 0;
+                    const winnable = suitCards.filter(card => (cardRanks[card.rank] || 0) > winningRank);
+                    
+                    if (winnable.length > 0) {
+                        return winnable.reduce((min, card) => {
+                            return (cardRanks[card.rank] || 0) < (cardRanks[min.rank] || 0) ? card : min;
+                        });
+                    } else {
+                        return suitCards.reduce((min, card) => {
+                            return (cardRanks[card.rank] || 0) < (cardRanks[min.rank] || 0) ? card : min;
+                        });
                     }
                 }
                 
-                // Strategic special card usage
-                const strategicSpecials = validCards.filter(card => {
-                    if (card.rank === '2') return true; // Always good
-                    if (card.rank === 'K' && this.gameState.players.length > 2) return true;
-                    if (card.rank === 'A' && this.gameState.players.length > 2) return true;
-                    return false;
-                });
-                
-                if (strategicSpecials.length > 0) {
-                    return strategicSpecials[0];
-                }
-                
-                // Prefer rank matches to maintain control
-                const rankMatches = validCards.filter(card => card.rank === lastCard.rank);
-                if (rankMatches.length > 0) {
-                    return rankMatches[0];
-                }
-                
-                return validCards[0];
-                
             default:
-                return validCards[0];
+                return suitCards[0];
         }
     }
 
+    chooseFromAnyCards(cards, aiLevel) {
+        // When can't follow suit, generally play low point cards
+        const cardPoints = cards.map(card => ({ card, points: this.getCardPoints(card) }));
+        cardPoints.sort((a, b) => a.points - b.points);
+        
+        switch(aiLevel) {
+            case 'beginner':
+                return cards[Math.floor(Math.random() * cards.length)];
+            case 'intermediate':
+            case 'advanced':
+                // Play lowest point card
+                return cardPoints[0].card;
+            default:
+                return cards[0];
+        }
+    }
+
+    getCurrentTrickWinner() {
+        if (this.gameState.currentTrick.length === 0) return null;
+        
+        const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+        const validPlays = this.gameState.currentTrick.filter(play => 
+            play.card.suit === this.gameState.callingSuit
+        );
+        
+        if (validPlays.length === 0) return this.gameState.currentTrick[0];
+        
+        return validPlays.reduce((highest, current) => {
+            const highestRank = cardRanks[highest.card.rank] || 0;
+            const currentRank = cardRanks[current.card.rank] || 0;
+            return currentRank > highestRank ? current : highest;
+        });
+    }
+
     // =========================================================================
-    // Static Deck & Card Methods - Updated for Tooza
+    // Static Deck & Card Methods - Standard 52 Card Deck
     // =========================================================================
 
-    static createToozaDeck() {
+    static createStandardDeck() {
         const suits = ['♠', '♣', '♥', '♦'];
-        const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+        const ranks = ['A', '3', '4', '5', '6', '7', '8', '9', '10'];
         const deck = [];
         let idCounter = 1;
         
@@ -544,7 +624,7 @@ class GameEngine {
                     id: idCounter++,
                     suit,
                     rank,
-                    isSpecial: ['A', '2', '8', 'J', 'K'].includes(rank)
+                    isSpecial: rank === '3' && suit === '♠' // Black 3 is special
                 });
             });
         });
@@ -558,26 +638,6 @@ class GameEngine {
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
         return shuffled;
-    }
-
-    static initializeGame(players) {
-        return {
-            players: players.map((player, index) => ({
-                ...player,
-                cards: [],
-                points: 0,
-                isDealer: index === 0,
-                isCurrent: index === 0
-            })),
-            deck: this.shuffleDeck(this.createToozaDeck()),
-            discardPile: [],
-            gamePhase: 'playing',
-            status: 'playing',
-            currentPlayerIndex: 0,
-            lastPlayedCard: null,
-            gameDirection: 1,
-            round: 1
-        };
     }
 }
 

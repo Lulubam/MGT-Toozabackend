@@ -1,4 +1,4 @@
-// game/GameEngine.jsvs2qwen
+// game/GameEngine.jsvs2aqwen
 class GameEngine {
   constructor(roomCode) {
     this.roomCode = roomCode;
@@ -15,8 +15,8 @@ class GameEngine {
       callingSuit: null,
       trickWinner: null,
       finalTrickWinner: null,
-      dealingMode: 'auto', // 'auto' or 'manual'
-      dealerSelection: 'highest', // 'highest' or 'lowest'
+      dealingMode: 'auto',
+      dealerSelection: 'highest',
       nextPlayerToDeal: null,
       cardsDealt: 0,
       totalCardsToDeal: 0
@@ -91,7 +91,14 @@ class GameEngine {
   }
 
   removeAIPlayer(aiKey) {
-    const AI_PLAYERS = { ... }; // same as above
+    const AI_PLAYERS = {
+      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+      agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
+    };
+
     const config = AI_PLAYERS[aiKey];
     if (!config) return { success: false, error: 'Invalid AI' };
 
@@ -104,8 +111,8 @@ class GameEngine {
   }
 
   setDealingMode(mode, selection) {
-    this.gameState.dealingMode = mode; // 'auto' or 'manual'
-    this.gameState.dealerSelection = selection; // 'highest' or 'lowest'
+    this.gameState.dealingMode = mode;
+    this.gameState.dealerSelection = selection;
     return { success: true };
   }
 
@@ -178,31 +185,19 @@ class GameEngine {
     const dealer = this.gameState.dealerIndex;
     const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
 
-    // Deal 3 cards first
-    for (let i = 0; i < 3; i++) {
-      let idx = (dealer + 1) % this.gameState.players.length;
-      for (let j = 0; j < activePlayers.length; j++) {
-        while (this.gameState.players[idx].isEliminated) {
+    for (let phase = 0; phase < 2; phase++) {
+      const cardsToDeal = phase === 0 ? 3 : 2;
+      for (let i = 0; i < cardsToDeal; i++) {
+        let idx = (dealer + 1) % this.gameState.players.length;
+        for (let j = 0; j < activePlayers.length; j++) {
+          while (this.gameState.players[idx].isEliminated) {
+            idx = (idx + 1) % this.gameState.players.length;
+          }
+          if (this.gameState.deck.length > 0) {
+            this.gameState.players[idx].cards.push(this.gameState.deck.pop());
+          }
           idx = (idx + 1) % this.gameState.players.length;
         }
-        if (this.gameState.deck.length > 0) {
-          this.gameState.players[idx].cards.push(this.gameState.deck.pop());
-        }
-        idx = (idx + 1) % this.gameState.players.length;
-      }
-    }
-
-    // Deal 2 more cards
-    for (let i = 0; i < 2; i++) {
-      let idx = (dealer + 1) % this.gameState.players.length;
-      for (let j = 0; j < activePlayers.length; j++) {
-        while (this.gameState.players[idx].isEliminated) {
-          idx = (idx + 1) % this.gameState.players.length;
-        }
-        if (this.gameState.deck.length > 0) {
-          this.gameState.players[idx].cards.push(this.gameState.deck.pop());
-        }
-        idx = (idx + 1) % this.gameState.players.length;
       }
     }
 

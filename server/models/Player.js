@@ -4,11 +4,14 @@ const mongoose = require('mongoose');
 const playerSchema = new mongoose.Schema({
     username: { 
         type: String, 
-        required: true 
+        required: true,
+        trim: true,
+        maxlength: 50
     },
     roomCode: { 
         type: String, 
-        required: true 
+        required: true,
+        uppercase: true
     },
     socketId: { 
         type: String, 
@@ -26,6 +29,10 @@ const playerSchema = new mongoose.Schema({
         type: String,
         enum: ['beginner', 'intermediate', 'advanced'],
         default: null
+    },
+    avatar: {
+        type: String,
+        default: '👤'
     },
     lastSeen: {
         type: Date,

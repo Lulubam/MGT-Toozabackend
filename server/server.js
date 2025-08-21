@@ -12,16 +12,16 @@ const mongoose = require('mongoose');
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO CORS — Allow frontend only
+// Socket.IO CORS - Allow only frontend
 const io = socketIo(server, {
   cors: {
     origin: process.env.NODE_ENV === 'production'
-      ? 'https://mgt-tooza.onrender.com'  // ✅ Frontend URL
+      ? 'https://mgt-tooza.onrender.com'
       : 'http://localhost:3000',
     methods: ['GET', 'POST'],
     credentials: true
   },
-  transports: ['websocket', 'polling']
+  transports: ['websocket']
 });
 
 // Middleware
@@ -62,7 +62,7 @@ app.post('/api/create-room', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Player name is required' });
     }
 
-    const roomCode = generateRoomCode();
+    const roomCode = generateRoomCode().toUpperCase();
     const newRoom = new Room({
       code: roomCode,
       maxPlayers: 6,
@@ -172,7 +172,8 @@ io.on('connection', (socket) => {
       const gameEngine = gameEngines[roomCode];
       gameEngine.updatePlayers(room.players);
 
-      io.to(roomCode).emit('game-state', gameEngine.getGameState());
+      socket.emit('game-state', gameEngine.getGameState());
+      socket.to(roomCode).emit('game-message', { message: `${player.username} joined the room` });
     } catch (error) {
       console.error('Error joining game:', error);
       socket.emit('error', { message: 'Failed to join game' });
@@ -217,6 +218,7 @@ io.on('connection', (socket) => {
         await room.save();
 
         result = gameEngine.addAIPlayer(aiKey);
+        result.message = `${config.name} joined the game`;
       } else if (action === 'remove') {
         const aiPlayer = room.players.find(p => p.username === config.name && p.isAI);
         if (!aiPlayer) return socket.emit('error', { message: 'AI not found' });
@@ -226,6 +228,7 @@ io.on('connection', (socket) => {
         await room.save();
 
         result = gameEngine.removeAIPlayer(aiKey);
+        result.message = `${config.name} left the game`;
       } else {
         return socket.emit('error', { message: 'Invalid action' });
       }
@@ -233,6 +236,7 @@ io.on('connection', (socket) => {
       if (result.success) {
         const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
         gameEngine.updatePlayers(updatedRoom.players);
+
         io.to(room.code).emit('game-state', gameEngine.getGameState());
         io.to(room.code).emit('game-message', { message: result.message });
       } else {
@@ -244,7 +248,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('game-action', async ({ action, cardId }) => {
+  socket.on('game-action', async ({ action, cardId, autoDeal, highCard, playerId }) => {
     try {
       const player = await Player.findOne({ socketId: socket.id });
       if (!player) return socket.emit('error', { message: 'Player not found' });
@@ -253,8 +257,18 @@ io.on('connection', (socket) => {
       if (!gameEngine) return socket.emit('error', { message: 'Game not found' });
 
       let result;
-      if (action === 'startGame') {
+
+      if (action === 'set-dealing-mode') {
+        const p = await Player.findById(playerId);
+        if (!p || !p.isDealer) {
+          return socket.emit('error', { message: 'Only dealer can set mode' });
+        }
+        gameEngine.setDealingMode(autoDeal, highCard);
+        result = { success: true, message: `Mode set: ${autoDeal ? 'Auto' : 'Manual'} deal, ${highCard ? 'Highest' : 'Lowest'} card wins` };
+      } else if (action === 'startGame') {
         result = gameEngine.startGame();
+      } else if (action === 'deal-next-card') {
+        result = gameEngine.dealNextCard();
       } else {
         result = gameEngine.handleAction(action, player._id.toString(), cardId);
       }
@@ -319,15 +333,22 @@ app.get('/', (req, res) => {
     features: [
       'Create/Join rooms',
       'Add/Remove AI players in-game',
+      'Manual or Auto dealing (dealer choice)',
+      'Highest or Lowest card dealer selection',
       'Real-time multiplayer with proper synchronization',
       'Trick-taking game rules implementation',
-      'Advanced AI with different difficulty levels',
-      'Elimination-based scoring system'
+      'Advanced AI with different difficulty levels'
     ]
   });
 });
 
-const PORT = process.env.PORT || 3001;
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
+
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);

@@ -17,7 +17,6 @@ class GameEngine {
       finalTrickWinner: null,
       autoDeal: true,
       highCardDealer: true,
-      dealingPhase: 'not-started',
       nextPlayerToDeal: null
     };
   }
@@ -90,7 +89,14 @@ class GameEngine {
   }
 
   removeAIPlayer(aiKey) {
-    const AI_PLAYERS = { ... }; // same as above
+    const AI_PLAYERS = {
+      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+      agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
+    };
+
     const config = AI_PLAYERS[aiKey];
     if (!config) return { success: false, error: 'Invalid AI' };
 
@@ -103,8 +109,8 @@ class GameEngine {
   }
 
   setDealingMode(autoDeal, highCard) {
-    this.gameState.autoDeal = autoDeal;
-    this.gameState.highCardDealer = highCard;
+    this.gameState.autoDeal = !!autoDeal;
+    this.gameState.highCardDealer = !!highCard;
     return { success: true };
   }
 
@@ -115,7 +121,7 @@ class GameEngine {
     this.selectInitialDealer();
     this.gameState.status = 'waiting';
     this.gameState.gamePhase = this.gameState.autoDeal ? 'playing' : 'manual-dealing';
-    
+
     if (this.gameState.autoDeal) {
       this.dealCards();
       this.gameState.status = 'playing';
@@ -134,13 +140,15 @@ class GameEngine {
     });
 
     const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
-    
+
     const winner = this.gameState.highCardDealer
       ? draws.reduce((a, b) => cardRanks[b.card.rank] > cardRanks[a.card.rank] ? b : a)
       : draws.reduce((a, b) => cardRanks[b.card.rank] < cardRanks[a.card.rank] ? b : a);
 
     this.gameState.dealerIndex = winner.index;
     this.gameState.players[winner.index].isDealer = true;
+    this.gameState.currentPlayerIndex = (winner.index + 1) % this.gameState.players.length;
+    this.updateCurrentPlayer();
   }
 
   createStandardDeck() {
@@ -213,10 +221,98 @@ class GameEngine {
     return { success: true, message: `Dealt to ${player.username}` };
   }
 
+  handleAction(action, playerId, cardId) {
+    const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
+    if (!currentPlayer || currentPlayer._id !== playerId) {
+      return { success: false, error: 'Not your turn' };
+    }
+
+    if (action === 'playCard') {
+      const cardIndex = currentPlayer.cards.findIndex(c => c.id === cardId);
+      if (cardIndex === -1) return { success: false, error: 'Card not in hand' };
+
+      const card = currentPlayer.cards[cardIndex];
+      const isValid = this.isValidPlay(card, currentPlayer);
+      if (!isValid) {
+        currentPlayer.points += 2;
+        currentPlayer.cards.splice(cardIndex, 1);
+        this.nextPlayer();
+        return { success: true, message: 'Foul play: penalty applied' };
+      }
+
+      this.gameState.currentTrick.push({
+        card,
+        player: currentPlayer.username,
+        avatar: currentPlayer.avatar
+      });
+
+      if (!this.gameState.callingSuit) {
+        this.gameState.callingSuit = card.suit;
+      }
+
+      currentPlayer.cards.splice(cardIndex, 1);
+
+      if (this.gameState.currentTrick.length === this.gameState.players.length) {
+        const winner = this.determineTrickWinner();
+        this.gameState.players.find(p => p.username === winner).points += 1;
+        this.endTrick();
+      } else {
+        this.nextPlayer();
+      }
+
+      return { success: true, message: 'Card played' };
+    }
+
+    return { success: false, error: 'Unknown action' };
+  }
+
+  isValidPlay(card, player) {
+    if (this.gameState.currentTrick.length === 0) return true;
+    if (!this.gameState.callingSuit) return true;
+    const hasCallingSuit = player.cards.some(c => c.suit === this.gameState.callingSuit);
+    if (hasCallingSuit && card.suit !== this.gameState.callingSuit) {
+      return false;
+    }
+    return true;
+  }
+
+  determineTrickWinner() {
+    const leadSuit = this.gameState.currentTrick[0].card.suit;
+    const trumpSuit = '♠';
+    const ranks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+
+    let winner = this.gameState.currentTrick[0];
+    for (const play of this.gameState.currentTrick) {
+      const current = play.card;
+      const best = winner.card;
+      if (current.suit === trumpSuit && best.suit !== trumpSuit) {
+        winner = play;
+      } else if (current.suit === best.suit && ranks[current.rank] > ranks[best.rank]) {
+        winner = play;
+      }
+    }
+
+    return winner.player;
+  }
+
+  endTrick() {
+    this.gameState.trickHistory.push([...this.gameState.currentTrick]);
+    this.gameState.currentTrick = [];
+    this.gameState.callingSuit = null;
+    const winnerIndex = this.gameState.players.findIndex(p => p.username === this.gameState.trickWinner);
+    this.gameState.currentPlayerIndex = winnerIndex;
+    this.updateCurrentPlayer();
+  }
+
   updateCurrentPlayer() {
     this.gameState.players.forEach((p, i) => {
       p.isCurrent = i === this.gameState.currentPlayerIndex;
     });
+  }
+
+  nextPlayer() {
+    this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
+    this.updateCurrentPlayer();
   }
 
   getNextPlayer(index) {
@@ -225,8 +321,6 @@ class GameEngine {
     } while (this.gameState.players[index].isEliminated);
     return this.gameState.players[index].username;
   }
-
-  // ... rest of GameEngine methods (playCard, handleAction, etc.)
 }
 
 module.exports = GameEngine;

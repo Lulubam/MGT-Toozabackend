@@ -11,28 +11,37 @@ const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
+
+// Socket.IO CORS — Allow frontend only
 const io = socketIo(server, {
   cors: {
     origin: process.env.NODE_ENV === 'production'
-      ? ['https://mgt-toozabackend.onrender.com', 'https://mgt-tooza.netlify.app']
+      ? 'https://mgt-tooza.onrender.com'  // ✅ Frontend URL
       : 'http://localhost:3000',
     methods: ['GET', 'POST'],
     credentials: true
-  }
+  },
+  transports: ['websocket', 'polling']
 });
 
+// Middleware
 app.use(cors({
   origin: process.env.NODE_ENV === 'production'
-    ? ['https://mgt-toozabackend.onrender.com', 'https://mgt-tooza.netlify.app']
+    ? 'https://mgt-tooza.onrender.com'
     : 'http://localhost:3000',
   credentials: true
 }));
 app.use(express.json());
 
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/trickgame', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI, {
+  retryWrites: true,
+  w: 'majority',
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000
+}).then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
 const gameEngines = {};
 const playerSockets = {};
@@ -42,7 +51,7 @@ const AI_PLAYERS = {
   ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
   dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
   ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-  agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+  agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
 };
 
 // Create room
@@ -66,12 +75,11 @@ app.post('/api/create-room', async (req, res) => {
       isDealer: true,
       isAI: false
     });
-    
+
     await player.save();
     newRoom.players.push(player._id);
     await newRoom.save();
 
-    // Initialize game engine
     gameEngines[roomCode] = new GameEngine(roomCode);
     gameEngines[roomCode].updatePlayers([player]);
 
@@ -99,7 +107,7 @@ app.post('/api/join-room', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Room not found' });
     }
 
-    if (room.players.length >= room.maxPlayers) {
+    if (room.players.length >= 6) {
       return res.status(400).json({ success: false, error: 'Room is full' });
     }
 
@@ -114,12 +122,11 @@ app.post('/api/join-room', async (req, res) => {
       isDealer: false,
       isAI: false
     });
-    
+
     await player.save();
     room.players.push(player._id);
     await room.save();
 
-    // Update game engine
     const gameEngine = gameEngines[roomCode.toUpperCase()];
     if (gameEngine) {
       const updatedRoom = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
@@ -146,12 +153,11 @@ io.on('connection', (socket) => {
     try {
       const player = await Player.findById(playerId);
       const room = await Room.findOne({ code: roomCode }).populate('players');
-      
+
       if (!player || !room) {
         return socket.emit('error', { message: 'Invalid player or room' });
       }
 
-      // Update player socket info
       player.socketId = socket.id;
       player.isActive = true;
       await player.save();
@@ -159,18 +165,14 @@ io.on('connection', (socket) => {
       playerSockets[playerId] = socket.id;
       socket.join(roomCode);
 
-      // Initialize or get game engine
       if (!gameEngines[roomCode]) {
         gameEngines[roomCode] = new GameEngine(roomCode);
       }
-      
+
       const gameEngine = gameEngines[roomCode];
       gameEngine.updatePlayers(room.players);
-      
-      // Send current game state
+
       io.to(roomCode).emit('game-state', gameEngine.getGameState());
-      
-      console.log(`Player ${player.username} joined room ${roomCode}`);
     } catch (error) {
       console.error('Error joining game:', error);
       socket.emit('error', { message: 'Failed to join game' });
@@ -184,7 +186,7 @@ io.on('connection', (socket) => {
 
       const room = await Room.findOne({ code: player.roomCode }).populate('players');
       const gameEngine = gameEngines[room.code];
-      
+
       if (!gameEngine || !room) {
         return socket.emit('error', { message: 'Game not found' });
       }
@@ -197,11 +199,10 @@ io.on('connection', (socket) => {
         if (room.players.length >= 6) {
           return socket.emit('error', { message: 'Room is full (max 6 players)' });
         }
-        
+
         const exists = room.players.find(p => p.username === config.name && p.isAI);
         if (exists) return socket.emit('error', { message: 'AI already in room' });
 
-        // Create AI player in database
         const aiPlayer = new Player({
           username: config.name,
           roomCode: room.code,
@@ -212,34 +213,26 @@ io.on('connection', (socket) => {
           isActive: true
         });
         await aiPlayer.save();
-        
         room.players.push(aiPlayer._id);
         await room.save();
 
-        // Add to game engine
         result = gameEngine.addAIPlayer(aiKey);
-        
       } else if (action === 'remove') {
         const aiPlayer = room.players.find(p => p.username === config.name && p.isAI);
         if (!aiPlayer) return socket.emit('error', { message: 'AI not found' });
 
-        // Remove from database
         await Player.findByIdAndDelete(aiPlayer._id);
         room.players = room.players.filter(p => p._id.toString() !== aiPlayer._id.toString());
         await room.save();
 
-        // Remove from game engine
         result = gameEngine.removeAIPlayer(aiKey);
       } else {
         return socket.emit('error', { message: 'Invalid action' });
       }
 
       if (result.success) {
-        // Update game engine with new player list
         const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
         gameEngine.updatePlayers(updatedRoom.players);
-        
-        // Broadcast updated state
         io.to(room.code).emit('game-state', gameEngine.getGameState());
         io.to(room.code).emit('game-message', { message: result.message });
       } else {
@@ -267,16 +260,12 @@ io.on('connection', (socket) => {
       }
 
       if (result.success) {
-        // Update room in database
         const room = await Room.findOneAndUpdate(
           { code: player.roomCode },
           { gameState: gameEngine.getGameState() },
           { new: true }
         );
-
-        // Broadcast updated state
         io.to(player.roomCode).emit('game-state', gameEngine.getGameState());
-        
         if (result.message) {
           io.to(player.roomCode).emit('game-message', { message: result.message });
         }
@@ -286,22 +275,6 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error('Error handling game action:', error);
       socket.emit('error', { message: 'Game action failed' });
-    }
-  });
-
-  socket.on('leave-room', async ({ playerId, roomCode }) => {
-    try {
-      const player = await Player.findById(playerId);
-      if (player) {
-        player.isActive = false;
-        await player.save();
-        socket.leave(roomCode);
-        delete playerSockets[playerId];
-        
-        console.log(`Player ${player.username} left room ${roomCode}`);
-      }
-    } catch (error) {
-      console.error('Error leaving room:', error);
     }
   });
 
@@ -329,15 +302,29 @@ function generateRoomCode() {
   return result;
 }
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ success: false, error: 'Internal server error' });
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    activeRooms: Object.keys(gameEngines).length
+  });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Trick-Taking Card Game Server is running!',
+    features: [
+      'Create/Join rooms',
+      'Add/Remove AI players in-game',
+      'Real-time multiplayer with proper synchronization',
+      'Trick-taking game rules implementation',
+      'Advanced AI with different difficulty levels',
+      'Elimination-based scoring system'
+    ]
+  });
 });
 
 const PORT = process.env.PORT || 3001;

@@ -1,4 +1,4 @@
-// game/GameEngine.jsv6qwen
+// game/GameEngine.jsv5qwen
 class GameEngine {
   constructor(roomCode) {
     this.roomCode = roomCode;
@@ -14,12 +14,7 @@ class GameEngine {
       dealerIndex: 0,
       callingSuit: null,
       trickWinner: null,
-      finalTrickWinner: null,
-      dealingMode: 'auto',
-      dealerSelection: 'highest',
-      nextPlayerToDeal: null,
-      cardsDealt: 0,
-      totalCardsToDeal: 0
+      finalTrickWinner: null
     };
   }
 
@@ -110,31 +105,50 @@ class GameEngine {
     return { success: true, message: `${config.name} left` };
   }
 
-  setDealingMode(mode, selection) {
-    this.gameState.dealingMode = mode;
-    this.gameState.dealerSelection = selection;
-    return { success: true };
-  }
+  startGame() {
+    const active = this.gameState.players.filter(p => !p.isEliminated);
+    if (active.length < 2) return { success: false, error: 'Need at least 2 players' };
 
-  selectInitialDealer() {
+    // Dealer selection by highest card
     const tempDeck = this.shuffleDeck(this.createStandardDeck());
-    const draws = [];
-    this.gameState.players.forEach((p, i) => {
-      draws.push({ player: p, card: tempDeck[i], index: i });
-    });
-
+    let maxRank = -1;
+    let dealerIndex = 0;
     const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
 
-    const winner = this.gameState.dealerSelection === 'highest'
-      ? draws.reduce((a, b) => cardRanks[b.card.rank] > cardRanks[a.card.rank] ? b : a)
-      : draws.reduce((a, b) => cardRanks[b.card.rank] < cardRanks[a.card.rank] ? b : a);
+    this.gameState.players.forEach((p, i) => {
+      const rank = cardRanks[tempDeck[i].rank];
+      if (rank > maxRank) {
+        maxRank = rank;
+        dealerIndex = i;
+      }
+    });
 
-    this.gameState.dealerIndex = winner.index;
-    this.gameState.players[winner.index].isDealer = true;
-    this.gameState.currentPlayerIndex = (winner.index + 1) % this.gameState.players.length;
+    this.gameState.dealerIndex = dealerIndex;
+    this.gameState.players[dealerIndex].isDealer = true;
+    this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
     this.updateCurrentPlayer();
 
-    return { success: true, message: `${winner.player.username} is dealer` };
+    // Deal 5 cards to each player
+    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
+    const dealer = dealerIndex;
+
+    for (let i = 0; i < 5; i++) {
+      let idx = (dealer + 1) % this.gameState.players.length;
+      for (let j = 0; j < active.length; j++) {
+        while (this.gameState.players[idx].isEliminated) {
+          idx = (idx + 1) % this.gameState.players.length;
+        }
+        if (this.gameState.deck.length > 0) {
+          this.gameState.players[idx].cards.push(this.gameState.deck.pop());
+        }
+        idx = (idx + 1) % this.gameState.players.length;
+      }
+    }
+
+    this.gameState.status = 'playing';
+    this.gameState.gamePhase = 'playing';
+
+    return { success: true, message: 'Game started!' };
   }
 
   createStandardDeck() {
@@ -144,7 +158,7 @@ class GameEngine {
     let id = 1;
     suits.forEach(suit => {
       ranks.forEach(rank => {
-        deck.push({ suit, rank, id: id++, id: `${rank}${suit}` });
+        deck.push({ suit, rank, id: id++ });
       });
     });
     return deck;
@@ -157,73 +171,6 @@ class GameEngine {
       [d[i], d[j]] = [d[j], d[i]];
     }
     return d;
-  }
-
-  startGame() {
-    const active = this.gameState.players.filter(p => !p.isEliminated);
-    if (active.length < 2) return { success: false, error: 'Need at least 2 players' };
-
-    this.selectInitialDealer();
-
-    if (this.gameState.dealingMode === 'auto') {
-      this.dealCards();
-      this.gameState.status = 'playing';
-      this.gameState.gamePhase = 'playing';
-    } else {
-      this.gameState.status = 'waiting';
-      this.gameState.gamePhase = 'manual-dealing';
-      this.gameState.nextPlayerToDeal = this.getNextPlayer(this.gameState.dealerIndex);
-      this.gameState.cardsDealt = 0;
-      this.gameState.totalCardsToDeal = active.length * 5;
-    }
-
-    return { success: true, message: 'Game started!' };
-  }
-
-  dealCards() {
-    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
-    const dealer = this.gameState.dealerIndex;
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-
-    for (let phase = 0; phase < 2; phase++) {
-      const cardsToDeal = phase === 0 ? 3 : 2;
-      for (let i = 0; i < cardsToDeal; i++) {
-        let idx = (dealer + 1) % this.gameState.players.length;
-        for (let j = 0; j < activePlayers.length; j++) {
-          while (this.gameState.players[idx].isEliminated) {
-            idx = (idx + 1) % this.gameState.players.length;
-          }
-          if (this.gameState.deck.length > 0) {
-            this.gameState.players[idx].cards.push(this.gameState.deck.pop());
-          }
-          idx = (idx + 1) % this.gameState.players.length;
-        }
-      }
-    }
-
-    this.gameState.currentPlayerIndex = (dealer + 1) % this.gameState.players.length;
-    this.updateCurrentPlayer();
-  }
-
-  dealNextCard() {
-    if (this.gameState.cardsDealt >= this.gameState.totalCardsToDeal) {
-      this.gameState.gamePhase = 'playing';
-      this.gameState.status = 'playing';
-      return { success: true, message: 'All cards dealt!' };
-    }
-
-    const player = this.gameState.players[this.gameState.currentPlayerIndex];
-    const card = this.gameState.deck.pop();
-    player.cards.push(card);
-
-    this.gameState.cardsDealt++;
-    this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
-    while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated) {
-      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
-    }
-
-    this.gameState.nextPlayerToDeal = this.gameState.players[this.gameState.currentPlayerIndex].username;
-    return { success: true, message: `Dealt to ${player.username}` };
   }
 
   handleAction(action, playerId, cardId) {
@@ -257,7 +204,7 @@ class GameEngine {
 
       currentPlayer.cards.splice(cardIndex, 1);
 
-      if (this.gameState.currentTrick.length === this.gameState.players.filter(p => !p.isEliminated).length) {
+      if (this.gameState.currentTrick.length === this.gameState.players.length) {
         const winner = this.determineTrickWinner();
         this.gameState.players.find(p => p.username === winner).points += 1;
         this.endTrick();
@@ -318,13 +265,6 @@ class GameEngine {
   nextPlayer() {
     this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
     this.updateCurrentPlayer();
-  }
-
-  getNextPlayer(index) {
-    do {
-      index = (index + 1) % this.gameState.players.length;
-    } while (this.gameState.players[index].isEliminated);
-    return this.gameState.players[index].username;
   }
 }
 

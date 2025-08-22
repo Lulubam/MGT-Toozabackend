@@ -1,4 +1,4 @@
-// server.jsv5qwen
+// server.jsv6claude - Fixed Version
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
@@ -18,7 +18,7 @@ const AI_PLAYERS = {
   ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
   dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
   ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-  agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
+  agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
 };
 
 const io = socketIo(server, {
@@ -57,7 +57,13 @@ app.post('/api/create-room', async (req, res) => {
 
     const roomCode = generateRoomCode().toUpperCase();
     const newRoom = new Room({ code: roomCode, maxPlayers: 6 });
-    const player = new Player({ username: playerName.trim(), roomCode, isDealer: true, isAI: false });
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode, 
+      isDealer: false, // Will be determined by card draw
+      isAI: false,
+      avatar: '👤'
+    });
 
     await player.save();
     newRoom.players.push(player._id);
@@ -68,6 +74,7 @@ app.post('/api/create-room', async (req, res) => {
 
     res.status(200).json({ success: true, roomCode, playerId: player._id.toString() });
   } catch (error) {
+    console.error('Create room error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -87,12 +94,17 @@ app.post('/api/join-room', async (req, res) => {
     const existing = room.players.find(p => p.username === playerName.trim());
     if (existing) return res.status(400).json({ success: false, error: 'Player name taken' });
 
-    const player = new Player({ username: playerName.trim(), roomCode: roomCode.toUpperCase(), isAI: false });
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode: roomCode.toUpperCase(), 
+      isAI: false,
+      avatar: '👤'
+    });
     await player.save();
     room.players.push(player._id);
     await room.save();
 
-    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode);
+    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode.toUpperCase());
     if (!gameEngines[roomCode.toUpperCase()]) gameEngines[roomCode.toUpperCase()] = gameEngine;
 
     const updatedRoom = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
@@ -102,12 +114,15 @@ app.post('/api/join-room', async (req, res) => {
 
     res.status(200).json({ success: true, roomCode: roomCode.toUpperCase(), playerId: player._id.toString() });
   } catch (error) {
+    console.error('Join room error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 // Socket.IO
 io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+
   socket.on('join-game', async ({ playerId, roomCode }) => {
     try {
       const player = await Player.findById(playerId);
@@ -126,6 +141,7 @@ io.on('connection', (socket) => {
 
       socket.emit('game-state', gameEngine?.getGameState());
     } catch (error) {
+      console.error('Join game error:', error);
       socket.emit('error', { message: 'Failed to join game' });
     }
   });
@@ -145,10 +161,23 @@ io.on('connection', (socket) => {
 
       let result;
       if (action === 'add') {
-        if (room.players.length >= 6) return socket.emit('error', { message: 'Room is full' });
-        const exists = room.players.find(p => p.username === config.name && p.isAI);
-        if (exists) return socket.emit('error', { message: 'AI already in room' });
+        if (room.players.length >= 6) {
+          return socket.emit('error', { message: 'Room is full' });
+        }
 
+        // Check if AI already exists in DB
+        const existsInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (existsInDB) {
+          return socket.emit('error', { message: 'AI already in room' });
+        }
+
+        // Add to GameEngine first
+        result = gameEngine.addAIPlayer(aiKey);
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
+
+        // Then add to database
         const aiPlayer = new Player({
           username: config.name,
           roomCode: room.code,
@@ -161,30 +190,35 @@ io.on('connection', (socket) => {
         room.players.push(aiPlayer._id);
         await room.save();
 
-        result = gameEngine.addAIPlayer(aiKey);
-        result.message = `${config.name} joined`;
       } else if (action === 'remove') {
-        const aiPlayer = room.players.find(p => p.username === config.name && p.isAI);
-        if (!aiPlayer) return socket.emit('error', { message: 'AI not found' });
+        // Find AI in database
+        const aiPlayerInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (!aiPlayerInDB) {
+          return socket.emit('error', { message: 'AI not found in database' });
+        }
 
-        await Player.findByIdAndDelete(aiPlayer._id);
-        room.players = room.players.filter(p => p._id.toString() !== aiPlayer._id.toString());
+        // Remove from GameEngine first
+        result = gameEngine.removeAIPlayer(aiKey);
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
+
+        // Then remove from database
+        await Player.findByIdAndDelete(aiPlayerInDB._id);
+        room.players = room.players.filter(p => p._id.toString() !== aiPlayerInDB._id.toString());
         await room.save();
 
-        result = gameEngine.removeAIPlayer(aiKey);
-        result.message = `${config.name} left`;
       } else {
         return socket.emit('error', { message: 'Invalid action' });
       }
 
-      if (result.success) {
-        const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
-        gameEngine.updatePlayers(updatedRoom.players);
-        io.to(room.code).emit('game-state', gameEngine.getGameState());
-        io.to(room.code).emit('game-message', { message: result.message });
-      } else {
-        socket.emit('error', { message: result.error });
-      }
+      // Update game state and broadcast
+      const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
+      gameEngine.updatePlayers(updatedRoom.players);
+      
+      io.to(room.code).emit('game-state', gameEngine.getGameState());
+      io.to(room.code).emit('game-message', { message: result.message });
+
     } catch (error) {
       console.error('Error managing AI:', error);
       socket.emit('error', { message: 'Failed to manage AI' });
@@ -201,32 +235,52 @@ io.on('connection', (socket) => {
 
       let result;
       if (action === 'startGame') {
-        result = gameEngine.startGame();
-      } else {
+        result = gameEngine.handleAction(action, player._id.toString());
+      } else if (action === 'playCard') {
         result = gameEngine.handleAction(action, player._id.toString(), cardId);
+      } else {
+        return socket.emit('error', { message: 'Unknown action' });
       }
 
       if (result.success) {
-        const room = await Room.findOneAndUpdate(
+        // Save game state to database
+        await Room.findOneAndUpdate(
           { code: player.roomCode },
           { gameState: gameEngine.getGameState() },
           { new: true }
         );
+
+        // Broadcast updated game state
         io.to(player.roomCode).emit('game-state', gameEngine.getGameState());
+        
         if (result.message) {
           io.to(player.roomCode).emit('game-message', { message: result.message });
+        }
+
+        // If dealer selection happened, broadcast that info
+        if (result.dealerInfo) {
+          io.to(player.roomCode).emit('dealer-selected', result.dealerInfo);
         }
       } else {
         socket.emit('error', { message: result.error });
       }
     } catch (error) {
+      console.error('Game action error:', error);
       socket.emit('error', { message: 'Game action failed' });
     }
   });
 
   socket.on('disconnect', async () => {
-    const player = await Player.findOne({ socketId: socket.id });
-    if (player) player.isActive = false;
+    console.log('Player disconnected:', socket.id);
+    try {
+      const player = await Player.findOne({ socketId: socket.id });
+      if (player) {
+        player.isActive = false;
+        await player.save();
+      }
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
   });
 });
 

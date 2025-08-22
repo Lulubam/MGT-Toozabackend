@@ -1,4 +1,4 @@
-// game/GameEngine.jsv6claude - Fixed Version
+// game/GameEngine.jsv7qwen
 class GameEngine {
   constructor(roomCode) {
     this.roomCode = roomCode;
@@ -15,7 +15,12 @@ class GameEngine {
       callingSuit: null,
       trickWinner: null,
       finalTrickWinner: null,
-      dealerSelectionCards: [] // For dealer selection phase
+      dealingMode: 'auto',
+      gameOver: false,
+      lastTrickOptOut: false,
+      nextPlayerToDeal: null,
+      cardsDealt: 0,
+      totalCardsToDeal: 0
     };
   }
 
@@ -25,22 +30,19 @@ class GameEngine {
 
   updatePlayers(dbPlayers) {
     const playerIds = dbPlayers.map(p => p._id.toString());
-    
-    // Remove players not in DB (except AI that might not be in DB yet)
     this.gameState.players = this.gameState.players.filter(p =>
       playerIds.includes(p._id) || p.isAI
     );
 
-    // Add new players from DB
     dbPlayers.forEach(dbPlayer => {
       const existing = this.gameState.players.find(p => p._id === dbPlayer._id.toString());
-      if (!existing) {
+      if (!existing && !dbPlayer.isAI) {
         this.gameState.players.push({
-          _id: dbPlayer._id.toString(),
+          _id: dbPlayer._id,
           username: dbPlayer.username,
-          isAI: dbPlayer.isAI || false,
-          aiLevel: dbPlayer.aiLevel || null,
-          avatar: dbPlayer.avatar || '👤',
+          isAI: dbPlayer.isAI,
+          aiLevel: dbPlayer.aiLevel,
+          avatar: dbPlayer.avatar,
           socketId: dbPlayer.socketId,
           isDealer: false,
           isCurrent: false,
@@ -49,12 +51,6 @@ class GameEngine {
           cards: [],
           points: 0
         });
-      } else {
-        // Update existing player info
-        existing.username = dbPlayer.username;
-        existing.isAI = dbPlayer.isAI || false;
-        existing.avatar = dbPlayer.avatar || existing.avatar;
-        existing.socketId = dbPlayer.socketId;
       }
     });
   }
@@ -65,7 +61,7 @@ class GameEngine {
       ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
       dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
       ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+      agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
     };
 
     const config = AI_PLAYERS[aiKey];
@@ -74,11 +70,9 @@ class GameEngine {
       return { success: false, error: 'Room is full (max 6 players)' };
     }
 
-    // Check if AI already exists in game state (not just DB)
     const exists = this.gameState.players.some(p => p.username === config.name && p.isAI);
     if (exists) return { success: false, error: 'AI already in room' };
 
-    // Add to game state
     this.gameState.players.push({
       _id: `ai_${aiKey}_${Date.now()}`,
       username: config.name,
@@ -103,7 +97,7 @@ class GameEngine {
       ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
       dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
       ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+      agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
     };
 
     const config = AI_PLAYERS[aiKey];
@@ -117,90 +111,31 @@ class GameEngine {
     return { success: true, message: `${config.name} left` };
   }
 
-  // Dealer selection by drawing cards
-  selectDealer() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
+  setDealingMode(mode) {
+    this.gameState.dealingMode = mode;
+    return { success: true };
+  }
 
-    // Create temporary deck for dealer selection
+  selectInitialDealer() {
     const tempDeck = this.shuffleDeck(this.createStandardDeck());
-    const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
-    
     let maxRank = -1;
     let dealerIndex = 0;
-    
-    // Each player draws a card
-    this.gameState.dealerSelectionCards = [];
-    activePlayers.forEach((player, i) => {
-      const card = tempDeck[i];
-      const rank = cardRanks[card.rank];
-      
-      this.gameState.dealerSelectionCards.push({
-        player: player.username,
-        card: card,
-        rank: rank
-      });
-      
+    const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+
+    this.gameState.players.forEach((p, i) => {
+      const rank = cardRanks[tempDeck[i]?.rank] || 0;
       if (rank > maxRank) {
         maxRank = rank;
-        dealerIndex = this.gameState.players.findIndex(p => p._id === player._id);
+        dealerIndex = i;
       }
     });
 
-    // Set dealer
-    this.gameState.players.forEach(p => p.isDealer = false);
     this.gameState.dealerIndex = dealerIndex;
     this.gameState.players[dealerIndex].isDealer = true;
-    
-    // Set first player (to the left of dealer)
     this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
     this.updateCurrentPlayer();
 
-    return { 
-      success: true, 
-      message: `${this.gameState.players[dealerIndex].username} is the dealer`,
-      dealerSelectionCards: this.gameState.dealerSelectionCards
-    };
-  }
-
-  startGame() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
-
-    // Select dealer first
-    const dealerResult = this.selectDealer();
-    if (!dealerResult.success) return dealerResult;
-
-    // Deal 5 cards to each active player
-    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
-    const dealerIndex = this.gameState.dealerIndex;
-
-    // Deal cards in proper order (starting from dealer's left)
-    for (let cardNum = 0; cardNum < 5; cardNum++) {
-      let playerIndex = (dealerIndex + 1) % this.gameState.players.length;
-      
-      for (let i = 0; i < activePlayers.length; i++) {
-        // Skip eliminated players
-        while (this.gameState.players[playerIndex].isEliminated) {
-          playerIndex = (playerIndex + 1) % this.gameState.players.length;
-        }
-        
-        if (this.gameState.deck.length > 0) {
-          this.gameState.players[playerIndex].cards.push(this.gameState.deck.pop());
-        }
-        
-        playerIndex = (playerIndex + 1) % this.gameState.players.length;
-      }
-    }
-
-    this.gameState.status = 'playing';
-    this.gameState.gamePhase = 'playing';
-
-    return { 
-      success: true, 
-      message: 'Game started! Cards dealt.',
-      dealerInfo: dealerResult
-    };
+    return { success: true, message: `${this.gameState.players[dealerIndex].username} is dealer` };
   }
 
   createStandardDeck() {
@@ -208,13 +143,11 @@ class GameEngine {
     const ranks = ['A', '10', '9', '8', '7', '6', '5', '4', '3'];
     const deck = [];
     let id = 1;
-    
     suits.forEach(suit => {
       ranks.forEach(rank => {
-        deck.push({ suit, rank, id: id++ });
+        deck.push({ suit, rank, id: id++, id: `${rank}${suit}` });
       });
     });
-    
     return deck;
   }
 
@@ -227,11 +160,74 @@ class GameEngine {
     return d;
   }
 
-  handleAction(action, playerId, cardId) {
-    if (action === 'startGame') {
-      return this.startGame();
+  startGame() {
+    const active = this.gameState.players.filter(p => !p.isEliminated);
+    if (active.length < 1) return { success: false, error: 'Need at least 1 player' };
+
+    this.selectInitialDealer();
+
+    if (this.gameState.dealingMode === 'auto') {
+      this.dealCards();
+      this.gameState.status = 'playing';
+      this.gameState.gamePhase = 'playing';
+    } else {
+      this.gameState.status = 'waiting';
+      this.gameState.gamePhase = 'manual-dealing';
+      this.gameState.nextPlayerToDeal = this.getNextPlayer(this.gameState.dealerIndex);
+      this.gameState.cardsDealt = 0;
+      this.gameState.totalCardsToDeal = active.length * 5;
     }
 
+    return { success: true, message: 'Game started!' };
+  }
+
+  dealCards() {
+    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
+    const dealer = this.gameState.dealerIndex;
+    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+
+    for (let phase = 0; phase < 2; phase++) {
+      const cardsToDeal = phase === 0 ? 3 : 2;
+      for (let i = 0; i < cardsToDeal; i++) {
+        let idx = (dealer + 1) % this.gameState.players.length;
+        for (let j = 0; j < activePlayers.length; j++) {
+          while (this.gameState.players[idx].isEliminated) {
+            idx = (idx + 1) % this.gameState.players.length;
+          }
+          if (this.gameState.deck.length > 0) {
+            this.gameState.players[idx].cards.push(this.gameState.deck.pop());
+          }
+          idx = (idx + 1) % this.gameState.players.length;
+        }
+      }
+    }
+
+    this.gameState.currentPlayerIndex = (dealer + 1) % this.gameState.players.length;
+    this.updateCurrentPlayer();
+  }
+
+  dealNextCard() {
+    if (this.gameState.cardsDealt >= this.gameState.totalCardsToDeal) {
+      this.gameState.gamePhase = 'playing';
+      this.gameState.status = 'playing';
+      return { success: true, message: 'All cards dealt!' };
+    }
+
+    const player = this.gameState.players[this.gameState.currentPlayerIndex];
+    const card = this.gameState.deck.pop();
+    player.cards.push(card);
+
+    this.gameState.cardsDealt++;
+    this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
+    while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated) {
+      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
+    }
+
+    this.gameState.nextPlayerToDeal = this.gameState.players[this.gameState.currentPlayerIndex].username;
+    return { success: true, message: `Dealt to ${player.username}` };
+  }
+
+  handleAction(action, playerId, cardId) {
     const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
     if (!currentPlayer || currentPlayer._id !== playerId) {
       return { success: false, error: 'Not your turn' };
@@ -242,39 +238,41 @@ class GameEngine {
       if (cardIndex === -1) return { success: false, error: 'Card not in hand' };
 
       const card = currentPlayer.cards[cardIndex];
-      const isValid = this.isValidPlay(card, currentPlayer);
-      
-      if (!isValid) {
-        // Foul: penalty applied
-        currentPlayer.points += 2;
-        currentPlayer.cards.splice(cardIndex, 1);
-        this.nextPlayer();
-        return { success: true, message: 'Foul play: 2 penalty points applied' };
+
+      // ✅ Rule: Must follow suit if possible
+      if (this.gameState.currentTrick.length > 0 && this.gameState.callingSuit) {
+        const hasCallingSuit = currentPlayer.cards.some(c => c.suit === this.gameState.callingSuit);
+        if (hasCallingSuit && card.suit !== this.gameState.callingSuit) {
+          return { success: false, error: 'Must follow suit when possible' };
+        }
       }
 
-      // Play the card
-      this.gameState.currentTrick.push({
-        card,
-        player: currentPlayer.username,
-        playerId: currentPlayer._id,
-        avatar: currentPlayer.avatar
-      });
-
-      // Set calling suit if first card of trick
-      if (this.gameState.currentTrick.length === 1) {
+      if (this.gameState.currentTrick.length === 0) {
         this.gameState.callingSuit = card.suit;
       }
 
+      this.gameState.currentTrick.push({
+        card,
+        player: currentPlayer.username,
+        avatar: currentPlayer.avatar
+      });
+
       currentPlayer.cards.splice(cardIndex, 1);
 
-      // Check if trick is complete
       const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
       if (this.gameState.currentTrick.length === activePlayers.length) {
         const winner = this.determineTrickWinner();
+        this.gameState.trickWinner = winner;
         const winnerPlayer = this.gameState.players.find(p => p.username === winner);
-        if (winnerPlayer) {
-          winnerPlayer.points += 1;
+        if (winnerPlayer) winnerPlayer.points += 1;
+
+        // ✅ Last trick: fire points to next player
+        if (this.gameState.trickHistory.length === 4) {
+          const nextPlayer = this.getNextPlayer(this.getPlayerIndex(winner));
+          const points = this.getCardPoints(card);
+          nextPlayer.points += points;
         }
+
         this.endTrick();
       } else {
         this.nextPlayer();
@@ -286,140 +284,75 @@ class GameEngine {
     return { success: false, error: 'Unknown action' };
   }
 
-  isValidPlay(card, player) {
-    // First card of trick - always valid
-    if (this.gameState.currentTrick.length === 0) return true;
-    if (!this.gameState.callingSuit) return true;
-    
-    // Must follow suit if possible
-    const hasCallingSuit = player.cards.some(c => c.suit === this.gameState.callingSuit);
-    if (hasCallingSuit && card.suit !== this.gameState.callingSuit) {
-      return false; // Foul - must follow suit
-    }
-    
-    return true;
-  }
-
   determineTrickWinner() {
-    if (this.gameState.currentTrick.length === 0) return null;
-    
     const leadSuit = this.gameState.currentTrick[0].card.suit;
-    const trumpSuit = '♠'; // Spades are trump
+    const trumpSuit = '♠';
     const ranks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
 
     let winner = this.gameState.currentTrick[0];
-    
     for (const play of this.gameState.currentTrick) {
       const current = play.card;
       const best = winner.card;
-      
-      // Trump beats non-trump
       if (current.suit === trumpSuit && best.suit !== trumpSuit) {
         winner = play;
-      }
-      // Same suit - higher rank wins
-      else if (current.suit === best.suit && ranks[current.rank] > ranks[best.rank]) {
-        winner = play;
-      }
-      // Following suit beats non-following suit (unless trump involved)
-      else if (current.suit === leadSuit && best.suit !== leadSuit && best.suit !== trumpSuit) {
+      } else if (current.suit === best.suit && ranks[current.rank] > ranks[best.rank]) {
         winner = play;
       }
     }
 
-    this.gameState.trickWinner = winner.player;
     return winner.player;
   }
 
   endTrick() {
-    // Save completed trick to history
     this.gameState.trickHistory.push([...this.gameState.currentTrick]);
-    
-    // Clear current trick
     this.gameState.currentTrick = [];
     this.gameState.callingSuit = null;
-    
-    // Winner leads next trick
+
     const winnerIndex = this.gameState.players.findIndex(p => p.username === this.gameState.trickWinner);
-    if (winnerIndex !== -1) {
-      this.gameState.currentPlayerIndex = winnerIndex;
-      this.updateCurrentPlayer();
-    }
-    
-    // Check if round is complete (all cards played)
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    const allCardsPlayed = activePlayers.every(p => p.cards.length === 0);
-    
-    if (allCardsPlayed) {
-      this.endRound();
+    this.gameState.currentPlayerIndex = winnerIndex;
+    this.updateCurrentPlayer();
+
+    if (this.gameState.trickHistory.length === 5) {
+      this.prepareNextRound();
     }
   }
 
-  endRound() {
-    // Apply final trick damage based on rules
-    if (this.gameState.trickHistory.length > 0) {
-      const finalTrick = this.gameState.trickHistory[this.gameState.trickHistory.length - 1];
-      const finalWinner = finalTrick[finalTrick.length - 1]; // Last card played wins
-      
-      // Find player next to winner (clockwise)
-      const winnerIndex = this.gameState.players.findIndex(p => p.username === finalWinner.player);
-      const nextPlayerIndex = (winnerIndex + 1) % this.gameState.players.length;
-      const damagePlayer = this.gameState.players[nextPlayerIndex];
-      
-      // Calculate damage based on final winning card
-      const damage = this.calculateCardDamage(finalWinner.card);
-      damagePlayer.points += damage;
-      
-      // Check for elimination
-      if (damagePlayer.points >= 12) {
-        damagePlayer.isEliminated = true;
-      }
-    }
-    
-    // Check game end condition
-    const remainingPlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (remainingPlayers.length <= 1) {
-      this.gameState.gamePhase = 'ended';
-      this.gameState.status = 'ended';
-    } else {
-      // Start next round
-      this.gameState.round++;
-      this.nextDealer();
-      // Could auto-start next round or wait for player action
-    }
+  prepareNextRound() {
+    this.gameState.round++;
+    this.gameState.trickHistory = [];
+    this.gameState.callingSuit = null;
+    this.selectInitialDealer();
+    this.dealCards();
   }
 
-  calculateCardDamage(card) {
-    // Based on rules provided
-    if (card.suit === '♠' && card.rank === '3') return 12; // Black 3
-    if (card.rank === '3') return 6; // Other 3s
+  getCardPoints(card) {
+    if (card.suit === '♠' && card.rank === '3') return 12;
+    if (card.rank === '3') return 6;
     if (card.rank === '4') return 4;
     if (card.rank === 'A') return 2;
-    return 1; // All other cards
-  }
-
-  nextDealer() {
-    this.gameState.dealerIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
-    this.gameState.players.forEach((p, i) => {
-      p.isDealer = i === this.gameState.dealerIndex;
-    });
+    return 1;
   }
 
   updateCurrentPlayer() {
     this.gameState.players.forEach((p, i) => {
-      p.isCurrent = i === this.gameState.currentPlayerIndex && !p.isEliminated;
+      p.isCurrent = i === this.gameState.currentPlayerIndex;
     });
   }
 
   nextPlayer() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length === 0) return;
-    
-    do {
-      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
-    } while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated);
-    
+    this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
     this.updateCurrentPlayer();
+  }
+
+  getPlayerIndex(username) {
+    return this.gameState.players.findIndex(p => p.username === username);
+  }
+
+  getNextPlayer(index) {
+    do {
+      index = (index + 1) % this.gameState.players.length;
+    } while (this.gameState.players[index].isEliminated);
+    return this.gameState.players[index].username;
   }
 }
 

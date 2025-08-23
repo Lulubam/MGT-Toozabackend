@@ -1,4 +1,4 @@
-// server.jsv8claude - Enhanced Version with AI Processing
+// server.jsv8bclaude - Complete working version
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
@@ -36,17 +36,20 @@ app.use(cors({
     : 'http://localhost:3000',
   credentials: true
 }));
+
 app.use(express.json());
 
+// Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
   retryWrites: true,
   w: 'majority'
-}).then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+}).then(() => {
+  console.log('Connected to MongoDB');
+}).catch(err => {
+  console.error('MongoDB connection error:', err);
+});
 
 const gameEngines = {};
-
-// AI Processing Queue
 const aiQueue = new Map();
 
 // Process AI moves with delay for realistic feel
@@ -62,7 +65,25 @@ async function processAIMove(roomCode, gameEngine) {
     const result = gameEngine.handleAIMove();
     
     if (result.success) {
-// Create room
+      io.to(roomCode).emit('game-state', gameEngine.getGameState());
+      
+      if (result.message) {
+        io.to(roomCode).emit('game-message', { message: result.message });
+      }
+      
+      // Check if another AI move is needed
+      if (result.needsAIMove) {
+        setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
+      }
+    }
+  } catch (error) {
+    console.error('AI move error:', error);
+  } finally {
+    aiQueue.delete(roomCode);
+  }
+}
+
+// Create room endpoint
 app.post('/api/create-room', async (req, res) => {
   try {
     const { playerName } = req.body;
@@ -94,7 +115,7 @@ app.post('/api/create-room', async (req, res) => {
   }
 });
 
-// Join room
+// Join room endpoint
 app.post('/api/join-room', async (req, res) => {
   try {
     const { playerName, roomCode } = req.body;
@@ -134,7 +155,7 @@ app.post('/api/join-room', async (req, res) => {
   }
 });
 
-// Socket.IO
+// Socket.IO connection handling
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
 
@@ -255,7 +276,6 @@ io.on('connection', (socket) => {
       } else if (action === 'optOutLastTrick') {
         result = gameEngine.handleAction(action, player._id.toString());
       } else if (action === 'continueToNextRound') {
-        // Deal cards for next round
         result = gameEngine.dealCards();
       } else {
         return socket.emit('error', { message: 'Unknown action' });
@@ -305,6 +325,7 @@ io.on('connection', (socket) => {
   });
 });
 
+// Helper function to generate room codes
 function generateRoomCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let result = '';
@@ -314,6 +335,7 @@ function generateRoomCode() {
   return result;
 }
 
+// Start server
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

@@ -1,338 +1,426 @@
-// server.jsv8claude - Enhanced Version with AI Processing
-require('dotenv').config();
-const GameEngine = require('./game/GameEngine');
-const Player = require('./models/Player');
-const Room = require('./models/Room');
-const express = require('express');
-const http = require('http');
-const socketIo = require('socket.io');
-const cors = require('cors');
-const mongoose = require('mongoose');
-
-const app = express();
-const server = http.createServer(app);
-
-const AI_PLAYERS = {
-  otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
-  ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
-  dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
-  ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-  agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
-};
-
-const io = socketIo(server, {
-  cors: {
-    origin: process.env.NODE_ENV === 'production'
-      ? 'https://mgt-tooza.onrender.com'
-      : 'http://localhost:3000',
-    methods: ['GET', 'POST'],
-    credentials: true
+// game/GameEngine.jsv8claude - Fixed Version
+class GameEngine {
+  constructor(roomCode) {
+    this.roomCode = roomCode;
+    this.gameState = {
+      status: 'waiting',
+      players: [],
+      currentTrick: [],
+      trickHistory: [],
+      gamePhase: 'waiting',
+      deck: [],
+      round: 1,
+      currentPlayerIndex: 0,
+      dealerIndex: 0,
+      callingSuit: null,
+      trickWinner: null,
+      finalTrickWinner: null,
+      dealerSelectionCards: [] // For dealer selection phase
+    };
   }
-});
 
-app.use(cors({
-  origin: process.env.NODE_ENV === 'production'
-    ? 'https://mgt-tooza.onrender.com'
-    : 'http://localhost:3000',
-  credentials: true
-}));
-app.use(express.json());
+  getGameState() {
+    return JSON.parse(JSON.stringify(this.gameState));
+  }
 
-mongoose.connect(process.env.MONGODB_URI, {
-  retryWrites: true,
-  w: 'majority'
-}).then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
-const gameEngines = {};
-
-// AI Processing Queue
-const aiQueue = new Map();
-
-// Process AI moves with delay for realistic feel
-async function processAIMove(roomCode, gameEngine) {
-  if (aiQueue.has(roomCode)) return; // Already processing
-  
-  aiQueue.set(roomCode, true);
-  
-  try {
-    // Add delay for AI thinking time (1-3 seconds)
-    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
+  updatePlayers(dbPlayers) {
+    const playerIds = dbPlayers.map(p => p._id.toString());
     
-    const result = gameEngine.handleAIMove();
-    
-    if (result.success) {
-      io.to(roomCode).emit('game-state', gameEngine.getGameState());
-      
-      if (result.message) {
-        io.to(roomCode).emit('game-message', { message: result.message });
-      }
-      
-      // Check if another AI move is needed
-      if (result.needsAIMove) {
-        setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
-      }
-    }
-  } catch (error) {
-    console.error('AI move error:', error);
-  } finally {
-    aiQueue.delete(roomCode);
-  }
-}
+    // Remove players not in DB (except AI that might not be in DB yet)
+    this.gameState.players = this.gameState.players.filter(p =>
+      playerIds.includes(p._id) || p.isAI
+    );
 
-// Create room
-app.post('/api/create-room', async (req, res) => {
-  try {
-    const { playerName } = req.body;
-    if (!playerName || !playerName.trim()) {
-      return res.status(400).json({ success: false, error: 'Player name is required' });
-    }
-
-    const roomCode = generateRoomCode().toUpperCase();
-    const newRoom = new Room({ code: roomCode, maxPlayers: 6 });
-    const player = new Player({ 
-      username: playerName.trim(), 
-      roomCode, 
-      isDealer: false,
-      isAI: false,
-      avatar: '👤'
-    });
-
-    await player.save();
-    newRoom.players.push(player._id);
-    await newRoom.save();
-
-    gameEngines[roomCode] = new GameEngine(roomCode);
-    gameEngines[roomCode].updatePlayers([player]);
-
-    res.status(200).json({ success: true, roomCode, playerId: player._id.toString() });
-  } catch (error) {
-    console.error('Create room error:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Join room
-app.post('/api/join-room', async (req, res) => {
-  try {
-    const { playerName, roomCode } = req.body;
-    if (!playerName || !roomCode) {
-      return res.status(400).json({ success: false, error: 'Player name and room code are required' });
-    }
-
-    const room = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
-    if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
-    if (room.players.length >= 6) return res.status(400).json({ success: false, error: 'Room is full' });
-
-    const existing = room.players.find(p => p.username === playerName.trim());
-    if (existing) return res.status(400).json({ success: false, error: 'Player name taken' });
-
-    const player = new Player({ 
-      username: playerName.trim(), 
-      roomCode: roomCode.toUpperCase(), 
-      isAI: false,
-      avatar: '👤'
-    });
-    await player.save();
-    room.players.push(player._id);
-    await room.save();
-
-    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode.toUpperCase());
-    if (!gameEngines[roomCode.toUpperCase()]) gameEngines[roomCode.toUpperCase()] = gameEngine;
-
-    const updatedRoom = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
-    gameEngine.updatePlayers(updatedRoom.players);
-
-    io.to(roomCode.toUpperCase()).emit('game-state', gameEngine.getGameState());
-
-    res.status(200).json({ success: true, roomCode: roomCode.toUpperCase(), playerId: player._id.toString() });
-  } catch (error) {
-    console.error('Join room error:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Socket.IO
-io.on('connection', (socket) => {
-  console.log('Player connected:', socket.id);
-
-  socket.on('join-game', async ({ playerId, roomCode }) => {
-    try {
-      const player = await Player.findById(playerId);
-      const room = await Room.findOne({ code: roomCode }).populate('players');
-      if (!player || !room) return socket.emit('error', { message: 'Invalid player or room' });
-
-      player.socketId = socket.id;
-      await player.save();
-      socket.join(roomCode);
-
-      const gameEngine = gameEngines[roomCode];
-      if (gameEngine) {
-        const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
-        gameEngine.updatePlayers(updatedRoom.players);
-        
-        // Trigger AI move if current player is AI
-        if (gameEngine.isCurrentPlayerAI() && gameEngine.gameState.gamePhase === 'playing') {
-          setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
-        }
-      }
-
-      socket.emit('game-state', gameEngine?.getGameState());
-    } catch (error) {
-      console.error('Join game error:', error);
-      socket.emit('error', { message: 'Failed to join game' });
-    }
-  });
-
-  socket.on('manage-ai', async ({ action, aiKey }) => {
-    try {
-      const player = await Player.findOne({ socketId: socket.id });
-      if (!player) return socket.emit('error', { message: 'Player not found' });
-
-      const room = await Room.findOne({ code: player.roomCode }).populate('players');
-      const gameEngine = gameEngines[room.code];
-
-      if (!gameEngine || !room) return socket.emit('error', { message: 'Game not found' });
-
-      const config = AI_PLAYERS[aiKey];
-      if (!config) return socket.emit('error', { message: 'Invalid AI player' });
-
-      let result;
-      if (action === 'add') {
-        if (room.players.length >= 6) {
-          return socket.emit('error', { message: 'Room is full' });
-        }
-
-        const existsInDB = room.players.find(p => p.username === config.name && p.isAI);
-        if (existsInDB) {
-          return socket.emit('error', { message: 'AI already in room' });
-        }
-
-        result = gameEngine.addAIPlayer(aiKey);
-        if (!result.success) {
-          return socket.emit('error', { message: result.error });
-        }
-
-        const aiPlayer = new Player({
-          username: config.name,
-          roomCode: room.code,
-          isAI: true,
-          aiLevel: config.level,
-          avatar: config.avatar,
-          socketId: 'AI_PLAYER'
+    // Add new players from DB
+    dbPlayers.forEach(dbPlayer => {
+      const existing = this.gameState.players.find(p => p._id === dbPlayer._id.toString());
+      if (!existing) {
+        this.gameState.players.push({
+          _id: dbPlayer._id.toString(),
+          username: dbPlayer.username,
+          isAI: dbPlayer.isAI || false,
+          aiLevel: dbPlayer.aiLevel || null,
+          avatar: dbPlayer.avatar || '👤',
+          socketId: dbPlayer.socketId,
+          isDealer: false,
+          isCurrent: false,
+          isActive: true,
+          isEliminated: false,
+          cards: [],
+          points: 0
         });
-        await aiPlayer.save();
-        room.players.push(aiPlayer._id);
-        await room.save();
-
-      } else if (action === 'remove') {
-        const aiPlayerInDB = room.players.find(p => p.username === config.name && p.isAI);
-        if (!aiPlayerInDB) {
-          return socket.emit('error', { message: 'AI not found in database' });
-        }
-
-        result = gameEngine.removeAIPlayer(aiKey);
-        if (!result.success) {
-          return socket.emit('error', { message: result.error });
-        }
-
-        await Player.findByIdAndDelete(aiPlayerInDB._id);
-        room.players = room.players.filter(p => p._id.toString() !== aiPlayerInDB._id.toString());
-        await room.save();
       } else {
-        return socket.emit('error', { message: 'Invalid action' });
+        // Update existing player info
+        existing.username = dbPlayer.username;
+        existing.isAI = dbPlayer.isAI || false;
+        existing.avatar = dbPlayer.avatar || existing.avatar;
+        existing.socketId = dbPlayer.socketId;
       }
-
-      const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
-      gameEngine.updatePlayers(updatedRoom.players);
-      
-      io.to(room.code).emit('game-state', gameEngine.getGameState());
-      io.to(room.code).emit('game-message', { message: result.message });
-
-    } catch (error) {
-      console.error('Error managing AI:', error);
-      socket.emit('error', { message: 'Failed to manage AI' });
-    }
-  });
-
-  socket.on('game-action', async ({ action, cardId, data }) => {
-    try {
-      const player = await Player.findOne({ socketId: socket.id });
-      if (!player) return socket.emit('error', { message: 'Player not found' });
-
-      const gameEngine = gameEngines[player.roomCode];
-      if (!gameEngine) return socket.emit('error', { message: 'Game not found' });
-
-      let result;
-      if (action === 'startGame') {
-        result = gameEngine.handleAction(action, player._id.toString(), cardId, data || {});
-      } else if (action === 'playCard') {
-        result = gameEngine.handleAction(action, player._id.toString(), cardId);
-      } else if (action === 'adjustPoints') {
-        result = gameEngine.handleAction(action, player._id.toString(), cardId, data);
-      } else if (action === 'optOutLastTrick') {
-        result = gameEngine.handleAction(action, player._id.toString());
-      } else if (action === 'continueToNextRound') {
-        // Deal cards for next round
-        result = gameEngine.dealCards();
-      } else {
-        return socket.emit('error', { message: 'Unknown action' });
-      }
-
-      if (result.success) {
-        await Room.findOneAndUpdate(
-          { code: player.roomCode },
-          { gameState: gameEngine.getGameState() },
-          { new: true }
-        );
-
-        io.to(player.roomCode).emit('game-state', gameEngine.getGameState());
-        
-        if (result.message) {
-          io.to(player.roomCode).emit('game-message', { message: result.message });
-        }
-
-        if (result.dealerInfo) {
-          io.to(player.roomCode).emit('dealer-selected', result.dealerInfo);
-        }
-
-        // Process AI move if needed
-        if (result.needsAIMove) {
-          setTimeout(() => processAIMove(player.roomCode, gameEngine), 1000);
-        }
-      } else {
-        socket.emit('error', { message: result.error });
-      }
-    } catch (error) {
-      console.error('Game action error:', error);
-      socket.emit('error', { message: 'Game action failed' });
-    }
-  });
-
-  socket.on('disconnect', async () => {
-    console.log('Player disconnected:', socket.id);
-    try {
-      const player = await Player.findOne({ socketId: socket.id });
-      if (player) {
-        player.isActive = false;
-        await player.save();
-      }
-    } catch (error) {
-      console.error('Disconnect error:', error);
-    }
-  });
-});
-
-function generateRoomCode() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < 4; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+    });
   }
-  return result;
+
+  addAIPlayer(aiKey) {
+    const AI_PLAYERS = {
+      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+    };
+
+    const config = AI_PLAYERS[aiKey];
+    if (!config) return { success: false, error: 'Invalid AI' };
+    if (this.gameState.players.length >= 6) {
+      return { success: false, error: 'Room is full (max 6 players)' };
+    }
+
+    // Check if AI already exists in game state (not just DB)
+    const exists = this.gameState.players.some(p => p.username === config.name && p.isAI);
+    if (exists) return { success: false, error: 'AI already in room' };
+
+    // Add to game state
+    this.gameState.players.push({
+      _id: `ai_${aiKey}_${Date.now()}`,
+      username: config.name,
+      isAI: true,
+      aiLevel: config.level,
+      avatar: config.avatar,
+      cards: [],
+      points: 0,
+      isDealer: false,
+      isCurrent: false,
+      isActive: true,
+      isEliminated: false,
+      socketId: 'AI_PLAYER'
+    });
+
+    return { success: true, message: `${config.name} joined` };
+  }
+
+  removeAIPlayer(aiKey) {
+    const AI_PLAYERS = {
+      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+    };
+
+    const config = AI_PLAYERS[aiKey];
+    if (!config) return { success: false, error: 'Invalid AI' };
+
+    const index = this.gameState.players.findIndex(p => p.username === config.name && p.isAI);
+    if (index === -1) return { success: false, error: 'AI not found' };
+
+    this.gameState.players.splice(index, 1);
+    this.updateCurrentPlayer();
+    return { success: true, message: `${config.name} left` };
+  }
+
+  // Dealer selection by drawing cards
+  selectDealer() {
+    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
+
+    // Create temporary deck for dealer selection
+    const tempDeck = this.shuffleDeck(this.createStandardDeck());
+    const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+    
+    let maxRank = -1;
+    let dealerIndex = 0;
+    
+    // Each player draws a card
+    this.gameState.dealerSelectionCards = [];
+    activePlayers.forEach((player, i) => {
+      const card = tempDeck[i];
+      const rank = cardRanks[card.rank];
+      
+      this.gameState.dealerSelectionCards.push({
+        player: player.username,
+        card: card,
+        rank: rank
+      });
+      
+      if (rank > maxRank) {
+        maxRank = rank;
+        dealerIndex = this.gameState.players.findIndex(p => p._id === player._id);
+      }
+    });
+
+    // Set dealer
+    this.gameState.players.forEach(p => p.isDealer = false);
+    this.gameState.dealerIndex = dealerIndex;
+    this.gameState.players[dealerIndex].isDealer = true;
+    
+    // Set first player (to the left of dealer)
+    this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
+    this.updateCurrentPlayer();
+
+    return { 
+      success: true, 
+      message: `${this.gameState.players[dealerIndex].username} is the dealer`,
+      dealerSelectionCards: this.gameState.dealerSelectionCards
+    };
+  }
+
+  startGame() {
+    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
+
+    // Select dealer first
+    const dealerResult = this.selectDealer();
+    if (!dealerResult.success) return dealerResult;
+
+    // Deal 5 cards to each active player
+    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
+    const dealerIndex = this.gameState.dealerIndex;
+
+    // Deal cards in proper order (starting from dealer's left)
+    for (let cardNum = 0; cardNum < 5; cardNum++) {
+      let playerIndex = (dealerIndex + 1) % this.gameState.players.length;
+      
+      for (let i = 0; i < activePlayers.length; i++) {
+        // Skip eliminated players
+        while (this.gameState.players[playerIndex].isEliminated) {
+          playerIndex = (playerIndex + 1) % this.gameState.players.length;
+        }
+        
+        if (this.gameState.deck.length > 0) {
+          this.gameState.players[playerIndex].cards.push(this.gameState.deck.pop());
+        }
+        
+        playerIndex = (playerIndex + 1) % this.gameState.players.length;
+      }
+    }
+
+    this.gameState.status = 'playing';
+    this.gameState.gamePhase = 'playing';
+
+    return { 
+      success: true, 
+      message: 'Game started! Cards dealt.',
+      dealerInfo: dealerResult
+    };
+  }
+
+  createStandardDeck() {
+    const suits = ['♠', '♥', '♦', '♣'];
+    const ranks = ['A', '10', '9', '8', '7', '6', '5', '4', '3'];
+    const deck = [];
+    let id = 1;
+    
+    suits.forEach(suit => {
+      ranks.forEach(rank => {
+        deck.push({ suit, rank, id: id++ });
+      });
+    });
+    
+    return deck;
+  }
+
+  shuffleDeck(deck) {
+    const d = [...deck];
+    for (let i = d.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [d[i], d[j]] = [d[j], d[i]];
+    }
+    return d;
+  }
+
+  handleAction(action, playerId, cardId) {
+    if (action === 'startGame') {
+      return this.startGame();
+    }
+
+    const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
+    if (!currentPlayer || currentPlayer._id !== playerId) {
+      return { success: false, error: 'Not your turn' };
+    }
+
+    if (action === 'playCard') {
+      const cardIndex = currentPlayer.cards.findIndex(c => c.id === cardId);
+      if (cardIndex === -1) return { success: false, error: 'Card not in hand' };
+
+      const card = currentPlayer.cards[cardIndex];
+      const isValid = this.isValidPlay(card, currentPlayer);
+      
+      if (!isValid) {
+        // Foul: penalty applied
+        currentPlayer.points += 2;
+        currentPlayer.cards.splice(cardIndex, 1);
+        this.nextPlayer();
+        return { success: true, message: 'Foul play: 2 penalty points applied' };
+      }
+
+      // Play the card
+      this.gameState.currentTrick.push({
+        card,
+        player: currentPlayer.username,
+        playerId: currentPlayer._id,
+        avatar: currentPlayer.avatar
+      });
+
+      // Set calling suit if first card of trick
+      if (this.gameState.currentTrick.length === 1) {
+        this.gameState.callingSuit = card.suit;
+      }
+
+      currentPlayer.cards.splice(cardIndex, 1);
+
+      // Check if trick is complete
+      const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+      if (this.gameState.currentTrick.length === activePlayers.length) {
+        const winner = this.determineTrickWinner();
+        const winnerPlayer = this.gameState.players.find(p => p.username === winner);
+        if (winnerPlayer) {
+          winnerPlayer.points += 1;
+        }
+        this.endTrick();
+      } else {
+        this.nextPlayer();
+      }
+
+      return { success: true, message: 'Card played' };
+    }
+
+    return { success: false, error: 'Unknown action' };
+  }
+
+  isValidPlay(card, player) {
+    // First card of trick - always valid
+    if (this.gameState.currentTrick.length === 0) return true;
+    if (!this.gameState.callingSuit) return true;
+    
+    // Must follow suit if possible
+    const hasCallingSuit = player.cards.some(c => c.suit === this.gameState.callingSuit);
+    if (hasCallingSuit && card.suit !== this.gameState.callingSuit) {
+      return false; // Foul - must follow suit
+    }
+    
+    return true;
+  }
+
+  determineTrickWinner() {
+    if (this.gameState.currentTrick.length === 0) return null;
+    
+    const leadSuit = this.gameState.currentTrick[0].card.suit;
+    const trumpSuit = '♠'; // Spades are trump
+    const ranks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
+
+    let winner = this.gameState.currentTrick[0];
+    
+    for (const play of this.gameState.currentTrick) {
+      const current = play.card;
+      const best = winner.card;
+      
+      // Trump beats non-trump
+      if (current.suit === trumpSuit && best.suit !== trumpSuit) {
+        winner = play;
+      }
+      // Same suit - higher rank wins
+      else if (current.suit === best.suit && ranks[current.rank] > ranks[best.rank]) {
+        winner = play;
+      }
+      // Following suit beats non-following suit (unless trump involved)
+      else if (current.suit === leadSuit && best.suit !== leadSuit && best.suit !== trumpSuit) {
+        winner = play;
+      }
+    }
+
+    this.gameState.trickWinner = winner.player;
+    return winner.player;
+  }
+
+  endTrick() {
+    // Save completed trick to history
+    this.gameState.trickHistory.push([...this.gameState.currentTrick]);
+    
+    // Clear current trick
+    this.gameState.currentTrick = [];
+    this.gameState.callingSuit = null;
+    
+    // Winner leads next trick
+    const winnerIndex = this.gameState.players.findIndex(p => p.username === this.gameState.trickWinner);
+    if (winnerIndex !== -1) {
+      this.gameState.currentPlayerIndex = winnerIndex;
+      this.updateCurrentPlayer();
+    }
+    
+    // Check if round is complete (all cards played)
+    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+    const allCardsPlayed = activePlayers.every(p => p.cards.length === 0);
+    
+    if (allCardsPlayed) {
+      this.endRound();
+    }
+  }
+
+  endRound() {
+    // Apply final trick damage based on rules
+    if (this.gameState.trickHistory.length > 0) {
+      const finalTrick = this.gameState.trickHistory[this.gameState.trickHistory.length - 1];
+      const finalWinner = finalTrick[finalTrick.length - 1]; // Last card played wins
+      
+      // Find player next to winner (clockwise)
+      const winnerIndex = this.gameState.players.findIndex(p => p.username === finalWinner.player);
+      const nextPlayerIndex = (winnerIndex + 1) % this.gameState.players.length;
+      const damagePlayer = this.gameState.players[nextPlayerIndex];
+      
+      // Calculate damage based on final winning card
+      const damage = this.calculateCardDamage(finalWinner.card);
+      damagePlayer.points += damage;
+      
+      // Check for elimination
+      if (damagePlayer.points >= 12) {
+        damagePlayer.isEliminated = true;
+      }
+    }
+    
+    // Check game end condition
+    const remainingPlayers = this.gameState.players.filter(p => !p.isEliminated);
+    if (remainingPlayers.length <= 1) {
+      this.gameState.gamePhase = 'ended';
+      this.gameState.status = 'ended';
+    } else {
+      // Start next round
+      this.gameState.round++;
+      this.nextDealer();
+      // Could auto-start next round or wait for player action
+    }
+  }
+
+  calculateCardDamage(card) {
+    // Based on rules provided
+    if (card.suit === '♠' && card.rank === '3') return 12; // Black 3
+    if (card.rank === '3') return 6; // Other 3s
+    if (card.rank === '4') return 4;
+    if (card.rank === 'A') return 2;
+    return 1; // All other cards
+  }
+
+  nextDealer() {
+    this.gameState.dealerIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
+    this.gameState.players.forEach((p, i) => {
+      p.isDealer = i === this.gameState.dealerIndex;
+    });
+  }
+
+  updateCurrentPlayer() {
+    this.gameState.players.forEach((p, i) => {
+      p.isCurrent = i === this.gameState.currentPlayerIndex && !p.isEliminated;
+    });
+  }
+
+  nextPlayer() {
+    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
+    if (activePlayers.length === 0) return;
+    
+    do {
+      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
+    } while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated);
+    
+    this.updateCurrentPlayer();
+  }
 }
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+module.exports = GameEngine;

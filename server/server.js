@@ -1,4 +1,4 @@
-// server.jsv7qwen
+// server.jsv8claude - Enhanced Version with AI Processing
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
@@ -11,6 +11,14 @@ const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
+
+const AI_PLAYERS = {
+  otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+  ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+  dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+  ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+  agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+};
 
 const io = socketIo(server, {
   cors: {
@@ -38,15 +46,22 @@ mongoose.connect(process.env.MONGODB_URI, {
 
 const gameEngines = {};
 
-// AI Players
-const AI_PLAYERS = {
-  otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
-  ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
-  dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
-  ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-  agba: { name: 'Agba', level: 'advanced', avatar: '👑' }
-};
+// AI Processing Queue
+const aiQueue = new Map();
 
+// Process AI moves with delay for realistic feel
+async function processAIMove(roomCode, gameEngine) {
+  if (aiQueue.has(roomCode)) return; // Already processing
+  
+  aiQueue.set(roomCode, true);
+  
+  try {
+    // Add delay for AI thinking time (1-3 seconds)
+    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
+    
+    const result = gameEngine.handleAIMove();
+    
+    if (result.success) {
 // Create room
 app.post('/api/create-room', async (req, res) => {
   try {
@@ -57,7 +72,13 @@ app.post('/api/create-room', async (req, res) => {
 
     const roomCode = generateRoomCode().toUpperCase();
     const newRoom = new Room({ code: roomCode, maxPlayers: 6 });
-    const player = new Player({ username: playerName.trim(), roomCode, isDealer: true, isAI: false });
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode, 
+      isDealer: false,
+      isAI: false,
+      avatar: '👤'
+    });
 
     await player.save();
     newRoom.players.push(player._id);
@@ -68,6 +89,7 @@ app.post('/api/create-room', async (req, res) => {
 
     res.status(200).json({ success: true, roomCode, playerId: player._id.toString() });
   } catch (error) {
+    console.error('Create room error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -87,12 +109,17 @@ app.post('/api/join-room', async (req, res) => {
     const existing = room.players.find(p => p.username === playerName.trim());
     if (existing) return res.status(400).json({ success: false, error: 'Player name taken' });
 
-    const player = new Player({ username: playerName.trim(), roomCode: roomCode.toUpperCase(), isAI: false });
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode: roomCode.toUpperCase(), 
+      isAI: false,
+      avatar: '👤'
+    });
     await player.save();
     room.players.push(player._id);
     await room.save();
 
-    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode);
+    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode.toUpperCase());
     if (!gameEngines[roomCode.toUpperCase()]) gameEngines[roomCode.toUpperCase()] = gameEngine;
 
     const updatedRoom = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
@@ -102,12 +129,15 @@ app.post('/api/join-room', async (req, res) => {
 
     res.status(200).json({ success: true, roomCode: roomCode.toUpperCase(), playerId: player._id.toString() });
   } catch (error) {
+    console.error('Join room error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 // Socket.IO
 io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+
   socket.on('join-game', async ({ playerId, roomCode }) => {
     try {
       const player = await Player.findById(playerId);
@@ -122,10 +152,16 @@ io.on('connection', (socket) => {
       if (gameEngine) {
         const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
         gameEngine.updatePlayers(updatedRoom.players);
+        
+        // Trigger AI move if current player is AI
+        if (gameEngine.isCurrentPlayerAI() && gameEngine.gameState.gamePhase === 'playing') {
+          setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
+        }
       }
 
       socket.emit('game-state', gameEngine?.getGameState());
     } catch (error) {
+      console.error('Join game error:', error);
       socket.emit('error', { message: 'Failed to join game' });
     }
   });
@@ -143,16 +179,24 @@ io.on('connection', (socket) => {
       const config = AI_PLAYERS[aiKey];
       if (!config) return socket.emit('error', { message: 'Invalid AI player' });
 
-      const uniqueAIName = `${config.name}_${room.code}`;
       let result;
-
       if (action === 'add') {
-        if (room.players.length >= 6) return socket.emit('error', { message: 'Room is full' });
-        const exists = room.players.find(p => p.username === uniqueAIName && p.isAI);
-        if (exists) return socket.emit('error', { message: 'AI already in room' });
+        if (room.players.length >= 6) {
+          return socket.emit('error', { message: 'Room is full' });
+        }
+
+        const existsInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (existsInDB) {
+          return socket.emit('error', { message: 'AI already in room' });
+        }
+
+        result = gameEngine.addAIPlayer(aiKey);
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
 
         const aiPlayer = new Player({
-          username: uniqueAIName,
+          username: config.name,
           roomCode: room.code,
           isAI: true,
           aiLevel: config.level,
@@ -163,37 +207,37 @@ io.on('connection', (socket) => {
         room.players.push(aiPlayer._id);
         await room.save();
 
-        result = gameEngine.addAIPlayer(aiKey);
-        result.message = `${config.name} joined`;
       } else if (action === 'remove') {
-        const aiPlayer = room.players.find(p => p.username === uniqueAIName && p.isAI);
-        if (!aiPlayer) return socket.emit('error', { message: 'AI not found' });
-
-        await Player.findByIdAndDelete(aiPlayer._id);
-        room.players = room.players.filter(p => p._id.toString() !== aiPlayer._id.toString());
-        await room.save();
+        const aiPlayerInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (!aiPlayerInDB) {
+          return socket.emit('error', { message: 'AI not found in database' });
+        }
 
         result = gameEngine.removeAIPlayer(aiKey);
-        result.message = `${config.name} left`;
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
+
+        await Player.findByIdAndDelete(aiPlayerInDB._id);
+        room.players = room.players.filter(p => p._id.toString() !== aiPlayerInDB._id.toString());
+        await room.save();
       } else {
         return socket.emit('error', { message: 'Invalid action' });
       }
 
-      if (result.success) {
-        const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
-        gameEngine.updatePlayers(updatedRoom.players);
-        io.to(room.code).emit('game-state', gameEngine.getGameState());
-        io.to(room.code).emit('game-message', { message: result.message });
-      } else {
-        socket.emit('error', { message: result.error });
-      }
+      const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
+      gameEngine.updatePlayers(updatedRoom.players);
+      
+      io.to(room.code).emit('game-state', gameEngine.getGameState());
+      io.to(room.code).emit('game-message', { message: result.message });
+
     } catch (error) {
       console.error('Error managing AI:', error);
       socket.emit('error', { message: 'Failed to manage AI' });
     }
   });
 
-  socket.on('game-action', async ({ action, cardId, mode }) => {
+  socket.on('game-action', async ({ action, cardId, data }) => {
     try {
       const player = await Player.findOne({ socketId: socket.id });
       if (!player) return socket.emit('error', { message: 'Player not found' });
@@ -202,69 +246,64 @@ io.on('connection', (socket) => {
       if (!gameEngine) return socket.emit('error', { message: 'Game not found' });
 
       let result;
-
-      if (action === 'set-dealing-mode') {
-        gameEngine.setDealingMode(mode);
-        result = { success: true, message: `Dealing mode: ${mode}` };
-      } else if (action === 'startGame') {
-        result = gameEngine.startGame();
-      } else if (action === 'deal-next-card') {
-        result = gameEngine.dealNextCard();
-      } else {
+      if (action === 'startGame') {
+        result = gameEngine.handleAction(action, player._id.toString(), cardId, data || {});
+      } else if (action === 'playCard') {
         result = gameEngine.handleAction(action, player._id.toString(), cardId);
+      } else if (action === 'adjustPoints') {
+        result = gameEngine.handleAction(action, player._id.toString(), cardId, data);
+      } else if (action === 'optOutLastTrick') {
+        result = gameEngine.handleAction(action, player._id.toString());
+      } else if (action === 'continueToNextRound') {
+        // Deal cards for next round
+        result = gameEngine.dealCards();
+      } else {
+        return socket.emit('error', { message: 'Unknown action' });
       }
 
       if (result.success) {
-        const room = await Room.findOneAndUpdate(
+        await Room.findOneAndUpdate(
           { code: player.roomCode },
           { gameState: gameEngine.getGameState() },
           { new: true }
         );
+
         io.to(player.roomCode).emit('game-state', gameEngine.getGameState());
+        
         if (result.message) {
           io.to(player.roomCode).emit('game-message', { message: result.message });
         }
 
-        // Process AI turns
-        setTimeout(() => processAITurnChain(player.roomCode), 500);
+        if (result.dealerInfo) {
+          io.to(player.roomCode).emit('dealer-selected', result.dealerInfo);
+        }
+
+        // Process AI move if needed
+        if (result.needsAIMove) {
+          setTimeout(() => processAIMove(player.roomCode, gameEngine), 1000);
+        }
       } else {
         socket.emit('error', { message: result.error });
       }
     } catch (error) {
+      console.error('Game action error:', error);
       socket.emit('error', { message: 'Game action failed' });
     }
   });
 
   socket.on('disconnect', async () => {
-    const player = await Player.findOne({ socketId: socket.id });
-    if (player) player.isActive = false;
+    console.log('Player disconnected:', socket.id);
+    try {
+      const player = await Player.findOne({ socketId: socket.id });
+      if (player) {
+        player.isActive = false;
+        await player.save();
+      }
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
   });
 });
-
-// Process AI turns
-async function processAITurnChain(roomCode, maxDepth = 10, currentDepth = 0) {
-  if (currentDepth >= maxDepth) return;
-
-  const gameEngine = gameEngines[roomCode];
-  if (!gameEngine) return;
-
-  const gameState = gameEngine.getGameState();
-  const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-
-  if (currentPlayer?.isAI) {
-    const card = currentPlayer.cards[0];
-    const result = gameEngine.handleAction('playCard', currentPlayer._id, card.id);
-    if (result.success) {
-      const updatedRoom = await Room.findOneAndUpdate(
-        { code: roomCode },
-        { gameState: gameEngine.getGameState() },
-        { new: true }
-      );
-      io.to(roomCode).emit('game-state', gameEngine.getGameState());
-      processAITurnChain(roomCode, maxDepth, currentDepth + 1);
-    }
-  }
-}
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';

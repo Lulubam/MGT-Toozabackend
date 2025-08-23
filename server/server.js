@@ -1,4 +1,4 @@
-// server.jsv8bclaude - Complete working version
+// server.jsv8cclaude - Enhanced version with better error handling and debugging
 require('dotenv').config();
 const GameEngine = require('./game/GameEngine');
 const Player = require('./models/Player');
@@ -39,27 +39,26 @@ app.use(cors({
 
 app.use(express.json());
 
-// Connect to MongoDB
+// Connect to MongoDB with better error handling
 mongoose.connect(process.env.MONGODB_URI, {
   retryWrites: true,
   w: 'majority'
 }).then(() => {
-  console.log('Connected to MongoDB');
+  console.log('✅ Connected to MongoDB successfully');
 }).catch(err => {
-  console.error('MongoDB connection error:', err);
+  console.error('❌ MongoDB connection error:', err);
 });
 
 const gameEngines = {};
 const aiQueue = new Map();
 
-// Process AI moves with delay for realistic feel
+// Enhanced AI processing function
 async function processAIMove(roomCode, gameEngine) {
-  if (aiQueue.has(roomCode)) return; // Already processing
+  if (aiQueue.has(roomCode)) return;
   
   aiQueue.set(roomCode, true);
   
   try {
-    // Add delay for AI thinking time (1-3 seconds)
     await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
     
     const result = gameEngine.handleAIMove();
@@ -71,13 +70,12 @@ async function processAIMove(roomCode, gameEngine) {
         io.to(roomCode).emit('game-message', { message: result.message });
       }
       
-      // Check if another AI move is needed
       if (result.needsAIMove) {
         setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
       }
     }
   } catch (error) {
-    console.error('AI move error:', error);
+    console.error('AI move error for room', roomCode, ':', error);
   } finally {
     aiQueue.delete(roomCode);
   }
@@ -108,6 +106,7 @@ app.post('/api/create-room', async (req, res) => {
     gameEngines[roomCode] = new GameEngine(roomCode);
     gameEngines[roomCode].updatePlayers([player]);
 
+    console.log(`Room created: ${roomCode} by ${playerName}`);
     res.status(200).json({ success: true, roomCode, playerId: player._id.toString() });
   } catch (error) {
     console.error('Create room error:', error);
@@ -148,6 +147,7 @@ app.post('/api/join-room', async (req, res) => {
 
     io.to(roomCode.toUpperCase()).emit('game-state', gameEngine.getGameState());
 
+    console.log(`Player ${playerName} joined room ${roomCode.toUpperCase()}`);
     res.status(200).json({ success: true, roomCode: roomCode.toUpperCase(), playerId: player._id.toString() });
   } catch (error) {
     console.error('Join room error:', error);
@@ -155,35 +155,98 @@ app.post('/api/join-room', async (req, res) => {
   }
 });
 
-// Socket.IO connection handling
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Socket.IO connection handling with enhanced error handling
 io.on('connection', (socket) => {
-  console.log('Player connected:', socket.id);
+  console.log('🔌 Player connected:', socket.id);
 
+  // Enhanced join-game handler with better error handling
   socket.on('join-game', async ({ playerId, roomCode }) => {
+    console.log('📡 Join game request:', { playerId, roomCode, socketId: socket.id });
+    
     try {
-      const player = await Player.findById(playerId);
-      const room = await Room.findOne({ code: roomCode }).populate('players');
-      if (!player || !room) return socket.emit('error', { message: 'Invalid player or room' });
-
-      player.socketId = socket.id;
-      await player.save();
-      socket.join(roomCode);
-
-      const gameEngine = gameEngines[roomCode];
-      if (gameEngine) {
-        const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
-        gameEngine.updatePlayers(updatedRoom.players);
-        
-        // Trigger AI move if current player is AI
-        if (gameEngine.isCurrentPlayerAI() && gameEngine.gameState.gamePhase === 'playing') {
-          setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
-        }
+      // Validate input parameters
+      if (!playerId || !roomCode) {
+        console.error('❌ Invalid join-game parameters:', { playerId, roomCode });
+        return socket.emit('error', { message: 'Missing playerId or roomCode' });
       }
 
-      socket.emit('game-state', gameEngine?.getGameState());
+      // Find player
+      console.log('🔍 Looking for player:', playerId);
+      const player = await Player.findById(playerId);
+      if (!player) {
+        console.error('❌ Player not found:', playerId);
+        return socket.emit('error', { message: 'Player not found' });
+      }
+
+      // Find room
+      console.log('🔍 Looking for room:', roomCode);
+      const room = await Room.findOne({ code: roomCode }).populate('players');
+      if (!room) {
+        console.error('❌ Room not found:', roomCode);
+        return socket.emit('error', { message: 'Room not found' });
+      }
+
+      // Verify player belongs to this room
+      if (player.roomCode !== roomCode) {
+        console.error('❌ Player room mismatch:', { playerRoom: player.roomCode, requestedRoom: roomCode });
+        return socket.emit('error', { message: 'Player does not belong to this room' });
+      }
+
+      // Update player socket ID
+      player.socketId = socket.id;
+      player.isActive = true;
+      await player.save();
+      console.log('✅ Player updated with socket ID:', { playerId, socketId: socket.id });
+
+      // Join socket room
+      socket.join(roomCode);
+      console.log('✅ Socket joined room:', roomCode);
+
+      // Get or create game engine
+      let gameEngine = gameEngines[roomCode];
+      if (!gameEngine) {
+        console.log('🎮 Creating new game engine for room:', roomCode);
+        gameEngine = new GameEngine(roomCode);
+        gameEngines[roomCode] = gameEngine;
+      }
+
+      // Update game engine with current players
+      const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
+      if (updatedRoom) {
+        gameEngine.updatePlayers(updatedRoom.players);
+        console.log('✅ Game engine updated with players:', updatedRoom.players.length);
+      }
+      
+      // Trigger AI move if current player is AI
+      if (gameEngine.isCurrentPlayerAI() && gameEngine.gameState.gamePhase === 'playing') {
+        console.log('🤖 Triggering AI move');
+        setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
+      }
+
+      // Send game state to player
+      const gameState = gameEngine.getGameState();
+      socket.emit('game-state', gameState);
+      console.log('✅ Game state sent to player:', playerId);
+
+      // Notify other players
+      socket.to(roomCode).emit('player-joined', { 
+        playerId: player._id,
+        username: player.username,
+        avatar: player.avatar 
+      });
+
     } catch (error) {
-      console.error('Join game error:', error);
-      socket.emit('error', { message: 'Failed to join game' });
+      console.error('❌ Join game error:', error);
+      console.error('Error stack:', error.stack);
+      socket.emit('error', { 
+        message: 'Failed to join game', 
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined 
+      });
     }
   });
 
@@ -298,7 +361,6 @@ io.on('connection', (socket) => {
           io.to(player.roomCode).emit('dealer-selected', result.dealerInfo);
         }
 
-        // Process AI move if needed
         if (result.needsAIMove) {
           setTimeout(() => processAIMove(player.roomCode, gameEngine), 1000);
         }
@@ -312,16 +374,22 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', async () => {
-    console.log('Player disconnected:', socket.id);
+    console.log('🔌 Player disconnected:', socket.id);
     try {
       const player = await Player.findOne({ socketId: socket.id });
       if (player) {
         player.isActive = false;
         await player.save();
+        console.log('✅ Player marked as inactive:', player.username);
       }
     } catch (error) {
       console.error('Disconnect error:', error);
     }
+  });
+
+  // Add error handling for socket errors
+  socket.on('error', (error) => {
+    console.error('Socket error for', socket.id, ':', error);
   });
 });
 
@@ -335,8 +403,19 @@ function generateRoomCode() {
   return result;
 }
 
+// Error handling for uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 // Start server
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 Socket.IO server ready`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });

@@ -1,666 +1,338 @@
-// game/GameEngine.jsv8claude - Enhanced Version with AI and Proper Rules
-class GameEngine {
-  constructor(roomCode) {
-    this.roomCode = roomCode;
-    this.gameState = {
-      status: 'waiting',
-      players: [],
-      currentTrick: [],
-      trickHistory: [],
-      gamePhase: 'waiting', // waiting, dealerSelection, dealing, playing, roundEnd, gameEnd
-      deck: [],
-      round: 1,
-      currentPlayerIndex: 0,
-      dealerIndex: 0,
-      callingSuit: null,
-      trickWinner: null,
-      finalTrickWinner: null,
-      dealerSelectionCards: [],
-      dealingPhase: 1, // 1 or 2 (3 cards then 2 cards)
-      isManualDealing: false,
-      tricksInRound: 0,
-      lastTrickOptOuts: [], // Players who opted out of last trick
-      roundWinner: null
-    };
-  }
+// server.jsv8claude - Enhanced Version with AI Processing
+require('dotenv').config();
+const GameEngine = require('./game/GameEngine');
+const Player = require('./models/Player');
+const Room = require('./models/Room');
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
+const mongoose = require('mongoose');
 
-  getGameState() {
-    return JSON.parse(JSON.stringify(this.gameState));
-  }
+const app = express();
+const server = http.createServer(app);
 
-  updatePlayers(dbPlayers) {
-    const playerIds = dbPlayers.map(p => p._id.toString());
+const AI_PLAYERS = {
+  otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
+  ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
+  dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
+  ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
+  agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
+};
+
+const io = socketIo(server, {
+  cors: {
+    origin: process.env.NODE_ENV === 'production'
+      ? 'https://mgt-tooza.onrender.com'
+      : 'http://localhost:3000',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
+});
+
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production'
+    ? 'https://mgt-tooza.onrender.com'
+    : 'http://localhost:3000',
+  credentials: true
+}));
+app.use(express.json());
+
+mongoose.connect(process.env.MONGODB_URI, {
+  retryWrites: true,
+  w: 'majority'
+}).then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+const gameEngines = {};
+
+// AI Processing Queue
+const aiQueue = new Map();
+
+// Process AI moves with delay for realistic feel
+async function processAIMove(roomCode, gameEngine) {
+  if (aiQueue.has(roomCode)) return; // Already processing
+  
+  aiQueue.set(roomCode, true);
+  
+  try {
+    // Add delay for AI thinking time (1-3 seconds)
+    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
     
-    // Remove players not in DB (except AI that might not be in DB yet)
-    this.gameState.players = this.gameState.players.filter(p =>
-      playerIds.includes(p._id) || p.isAI
-    );
-
-    // Add new players from DB
-    dbPlayers.forEach(dbPlayer => {
-      const existing = this.gameState.players.find(p => p._id === dbPlayer._id.toString());
-      if (!existing) {
-        this.gameState.players.push({
-          _id: dbPlayer._id.toString(),
-          username: dbPlayer.username,
-          isAI: dbPlayer.isAI || false,
-          aiLevel: dbPlayer.aiLevel || null,
-          avatar: dbPlayer.avatar || '👤',
-          socketId: dbPlayer.socketId,
-          isDealer: false,
-          isCurrent: false,
-          isActive: true,
-          isEliminated: false,
-          cards: [],
-          points: 0
-        });
-      } else {
-        // Update existing player info
-        existing.username = dbPlayer.username;
-        existing.isAI = dbPlayer.isAI || false;
-        existing.avatar = dbPlayer.avatar || existing.avatar;
-        existing.socketId = dbPlayer.socketId;
+    const result = gameEngine.handleAIMove();
+    
+    if (result.success) {
+      io.to(roomCode).emit('game-state', gameEngine.getGameState());
+      
+      if (result.message) {
+        io.to(roomCode).emit('game-message', { message: result.message });
       }
-    });
-  }
-
-  addAIPlayer(aiKey) {
-    const AI_PLAYERS = {
-      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
-      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
-      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
-      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
-    };
-
-    const config = AI_PLAYERS[aiKey];
-    if (!config) return { success: false, error: 'Invalid AI' };
-    if (this.gameState.players.length >= 6) {
-      return { success: false, error: 'Room is full (max 6 players)' };
-    }
-
-    const exists = this.gameState.players.some(p => p.username === config.name && p.isAI);
-    if (exists) return { success: false, error: 'AI already in room' };
-
-    this.gameState.players.push({
-      _id: `ai_${aiKey}_${Date.now()}`,
-      username: config.name,
-      isAI: true,
-      aiLevel: config.level,
-      avatar: config.avatar,
-      cards: [],
-      points: 0,
-      isDealer: false,
-      isCurrent: false,
-      isActive: true,
-      isEliminated: false,
-      socketId: 'AI_PLAYER'
-    });
-
-    return { success: true, message: `${config.name} joined` };
-  }
-
-  removeAIPlayer(aiKey) {
-    const AI_PLAYERS = {
-      otu: { name: 'Otu', level: 'beginner', avatar: '🤖' },
-      ase: { name: 'Ase', level: 'beginner', avatar: '🎭' },
-      dede: { name: 'Dede', level: 'intermediate', avatar: '🎪' },
-      ogbologbo: { name: 'Ogbologbo', level: 'advanced', avatar: '🎯' },
-      agba: { name: 'Agba', level: 'advanced', avatar: '🏆' }
-    };
-
-    const config = AI_PLAYERS[aiKey];
-    if (!config) return { success: false, error: 'Invalid AI' };
-
-    const index = this.gameState.players.findIndex(p => p.username === config.name && p.isAI);
-    if (index === -1) return { success: false, error: 'AI not found' };
-
-    this.gameState.players.splice(index, 1);
-    this.updateCurrentPlayer();
-    return { success: true, message: `${config.name} left` };
-  }
-
-  selectDealer() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
-
-    const tempDeck = this.shuffleDeck(this.createStandardDeck());
-    const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
-    
-    let maxRank = -1;
-    let dealerIndex = 0;
-    
-    this.gameState.dealerSelectionCards = [];
-    activePlayers.forEach((player, i) => {
-      const card = tempDeck[i];
-      const rank = cardRanks[card.rank];
       
-      this.gameState.dealerSelectionCards.push({
-        player: player.username,
-        card: card,
-        rank: rank
-      });
-      
-      if (rank > maxRank) {
-        maxRank = rank;
-        dealerIndex = this.gameState.players.findIndex(p => p._id === player._id);
-      }
-    });
-
-    this.gameState.players.forEach(p => p.isDealer = false);
-    this.gameState.dealerIndex = dealerIndex;
-    this.gameState.players[dealerIndex].isDealer = true;
-    
-    this.gameState.currentPlayerIndex = (dealerIndex + 1) % this.gameState.players.length;
-    this.updateCurrentPlayer();
-
-    return { 
-      success: true, 
-      message: `${this.gameState.players[dealerIndex].username} is the dealer`,
-      dealerSelectionCards: this.gameState.dealerSelectionCards
-    };
-  }
-
-  startGame(isManual = false) {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length < 2) return { success: false, error: 'Need at least 2 players' };
-
-    const dealerResult = this.selectDealer();
-    if (!dealerResult.success) return dealerResult;
-
-    this.gameState.isManualDealing = isManual;
-    this.gameState.gamePhase = isManual ? 'dealing' : 'playing';
-    this.gameState.status = 'playing';
-    this.gameState.dealingPhase = 1;
-
-    if (!isManual) {
-      return this.dealCards();
-    }
-
-    return { 
-      success: true, 
-      message: 'Game started! Ready for manual dealing.',
-      dealerInfo: dealerResult,
-      phase: 'dealing'
-    };
-  }
-
-  dealCards() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    this.gameState.deck = this.shuffleDeck(this.createStandardDeck());
-    const dealerIndex = this.gameState.dealerIndex;
-
-    // Phase 1: Deal 3 cards to each player
-    for (let cardNum = 0; cardNum < 3; cardNum++) {
-      let playerIndex = (dealerIndex + 1) % this.gameState.players.length;
-      
-      for (let i = 0; i < activePlayers.length; i++) {
-        while (this.gameState.players[playerIndex].isEliminated) {
-          playerIndex = (playerIndex + 1) % this.gameState.players.length;
-        }
-        
-        if (this.gameState.deck.length > 0) {
-          this.gameState.players[playerIndex].cards.push(this.gameState.deck.pop());
-        }
-        
-        playerIndex = (playerIndex + 1) % this.gameState.players.length;
+      // Check if another AI move is needed
+      if (result.needsAIMove) {
+        setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
       }
     }
-
-    // Phase 2: Deal 2 more cards to each player
-    for (let cardNum = 0; cardNum < 2; cardNum++) {
-      let playerIndex = (dealerIndex + 1) % this.gameState.players.length;
-      
-      for (let i = 0; i < activePlayers.length; i++) {
-        while (this.gameState.players[playerIndex].isEliminated) {
-          playerIndex = (playerIndex + 1) % this.gameState.players.length;
-        }
-        
-        if (this.gameState.deck.length > 0) {
-          this.gameState.players[playerIndex].cards.push(this.gameState.deck.pop());
-        }
-        
-        playerIndex = (playerIndex + 1) % this.gameState.players.length;
-      }
-    }
-
-    this.gameState.gamePhase = 'playing';
-    this.gameState.tricksInRound = 0;
-    this.gameState.lastTrickOptOuts = [];
-
-    return { 
-      success: true, 
-      message: 'Cards dealt! Game begins.',
-      phase: 'playing'
-    };
-  }
-
-  handleAction(action, playerId, cardId, data = {}) {
-    if (action === 'startGame') {
-      return this.startGame(data.isManual);
-    }
-
-    if (action === 'adjustPoints') {
-      return this.adjustPlayerPoints(playerId, data.targetPlayerId, data.adjustment);
-    }
-
-    if (action === 'optOutLastTrick') {
-      return this.handleOptOut(playerId);
-    }
-
-    const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
-    
-    if (action === 'playCard') {
-      // Check if it's AI turn and handle AI move
-      if (currentPlayer && currentPlayer.isAI) {
-        return this.handleAIMove();
-      }
-
-      if (!currentPlayer || currentPlayer._id !== playerId) {
-        return { success: false, error: 'Not your turn' };
-      }
-
-      const cardIndex = currentPlayer.cards.findIndex(c => c.id === cardId);
-      if (cardIndex === -1) return { success: false, error: 'Card not in hand' };
-
-      const card = currentPlayer.cards[cardIndex];
-      const validation = this.validatePlay(card, currentPlayer);
-      
-      if (!validation.isValid) {
-        currentPlayer.points += 2;
-        currentPlayer.cards.splice(cardIndex, 1);
-        this.nextPlayer();
-        return { success: true, message: validation.message, foul: true };
-      }
-
-      return this.playCard(currentPlayer, card, cardIndex);
-    }
-
-    return { success: false, error: 'Unknown action' };
-  }
-
-  validatePlay(card, player) {
-    // First card of trick - always valid
-    if (this.gameState.currentTrick.length === 0) {
-      return { isValid: true };
-    }
-
-    if (!this.gameState.callingSuit) {
-      return { isValid: true };
-    }
-    
-    // Check if player has calling suit
-    const hasCallingSuit = player.cards.some(c => c.suit === this.gameState.callingSuit);
-    
-    if (hasCallingSuit && card.suit !== this.gameState.callingSuit) {
-      return { 
-        isValid: false, 
-        message: 'Foul: Must follow suit when possible (2 penalty points)' 
-      };
-    }
-    
-    return { isValid: true };
-  }
-
-  playCard(player, card, cardIndex) {
-    this.gameState.currentTrick.push({
-      card,
-      player: player.username,
-      playerId: player._id,
-      avatar: player.avatar
-    });
-
-    if (this.gameState.currentTrick.length === 1) {
-      this.gameState.callingSuit = card.suit;
-    }
-
-    player.cards.splice(cardIndex, 1);
-
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    
-    if (this.gameState.currentTrick.length === activePlayers.length) {
-      const winner = this.determineTrickWinner();
-      const winnerPlayer = this.gameState.players.find(p => p.username === winner);
-      if (winnerPlayer) {
-        winnerPlayer.points += 1;
-      }
-      return this.endTrick();
-    } else {
-      this.nextPlayer();
-      return { success: true, message: 'Card played', needsAIMove: this.isCurrentPlayerAI() };
-    }
-  }
-
-  isCurrentPlayerAI() {
-    const currentPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
-    return currentPlayer && currentPlayer.isAI && !currentPlayer.isEliminated;
-  }
-
-  handleAIMove() {
-    const aiPlayer = this.gameState.players[this.gameState.currentPlayerIndex];
-    if (!aiPlayer || !aiPlayer.isAI || aiPlayer.cards.length === 0) {
-      return { success: false, error: 'Invalid AI state' };
-    }
-
-    // AI logic based on level
-    const card = this.selectAICard(aiPlayer);
-    const cardIndex = aiPlayer.cards.findIndex(c => c.id === card.id);
-    
-    const validation = this.validatePlay(card, aiPlayer);
-    if (!validation.isValid) {
-      aiPlayer.points += 2;
-      aiPlayer.cards.splice(cardIndex, 1);
-      this.nextPlayer();
-      return { 
-        success: true, 
-        message: `${aiPlayer.username} committed a foul (2 points)`,
-        foul: true,
-        needsAIMove: this.isCurrentPlayerAI()
-      };
-    }
-
-    return this.playCard(aiPlayer, card, cardIndex);
-  }
-
-  selectAICard(aiPlayer) {
-    const availableCards = [...aiPlayer.cards];
-    const callingSuit = this.gameState.callingSuit;
-    
-    // If must follow suit
-    if (callingSuit && this.gameState.currentTrick.length > 0) {
-      const suitCards = availableCards.filter(c => c.suit === callingSuit);
-      if (suitCards.length > 0) {
-        return this.chooseCardByLevel(suitCards, aiPlayer.aiLevel);
-      }
-    }
-    
-    // If leading or can't follow suit
-    return this.chooseCardByLevel(availableCards, aiPlayer.aiLevel);
-  }
-
-  chooseCardByLevel(cards, level) {
-    const cardRanks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
-    
-    switch (level) {
-      case 'beginner':
-        // Random choice
-        return cards[Math.floor(Math.random() * cards.length)];
-      
-      case 'intermediate':
-        // Avoid high-value penalty cards, prefer middle ranks
-        const safeCards = cards.filter(c => !(c.rank === '3' || c.rank === '4' || c.rank === 'A'));
-        return safeCards.length > 0 ? safeCards[Math.floor(Math.random() * safeCards.length)] : cards[0];
-      
-      case 'advanced':
-        // Strategic play: avoid penalty cards, play low when safe
-        const sortedCards = cards.sort((a, b) => cardRanks[a.rank] - cardRanks[b.rank]);
-        const dangerousCards = cards.filter(c => c.rank === '3' && c.suit === '♠');
-        
-        if (dangerousCards.length === cards.length) {
-          // Only dangerous cards left
-          return dangerousCards[0];
-        }
-        
-        // Play lowest safe card
-        return sortedCards.find(c => !(c.rank === '3' && c.suit === '♠')) || sortedCards[0];
-      
-      default:
-        return cards[0];
-    }
-  }
-
-  determineTrickWinner() {
-    if (this.gameState.currentTrick.length === 0) return null;
-    
-    const callingSuit = this.gameState.callingSuit;
-    const ranks = { 'A': 14, '10': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3 };
-
-    let winner = null;
-    let highestRank = -1;
-
-    // Only cards of calling suit can win
-    for (const play of this.gameState.currentTrick) {
-      if (play.card.suit === callingSuit) {
-        const rank = ranks[play.card.rank];
-        if (rank > highestRank) {
-          highestRank = rank;
-          winner = play;
-        }
-      }
-    }
-
-    // If no one played calling suit (shouldn't happen), first player wins
-    if (!winner) {
-      winner = this.gameState.currentTrick[0];
-    }
-
-    this.gameState.trickWinner = winner.player;
-    return winner.player;
-  }
-
-  endTrick() {
-    this.gameState.trickHistory.push([...this.gameState.currentTrick]);
-    this.gameState.currentTrick = [];
-    this.gameState.callingSuit = null;
-    this.gameState.tricksInRound++;
-    
-    const winnerIndex = this.gameState.players.findIndex(p => p.username === this.gameState.trickWinner);
-    if (winnerIndex !== -1) {
-      this.gameState.currentPlayerIndex = winnerIndex;
-      this.updateCurrentPlayer();
-    }
-    
-    // Check if round is complete (5 tricks played)
-    if (this.gameState.tricksInRound >= 5) {
-      return this.endRound();
-    }
-    
-    // Check if this is the 5th trick (last trick) - offer opt-out
-    if (this.gameState.tricksInRound === 4) {
-      this.gameState.gamePhase = 'lastTrickChoice';
-      return { 
-        success: true, 
-        message: 'Last trick coming up! Players can opt out.',
-        phase: 'lastTrickChoice',
-        needsAIMove: false
-      };
-    }
-
-    return { 
-      success: true, 
-      message: `Trick won by ${this.gameState.trickWinner}`,
-      needsAIMove: this.isCurrentPlayerAI()
-    };
-  }
-
-  handleOptOut(playerId) {
-    const player = this.gameState.players.find(p => p._id === playerId);
-    if (!player) return { success: false, error: 'Player not found' };
-    
-    if (this.gameState.gamePhase !== 'lastTrickChoice') {
-      return { success: false, error: 'Not time for opt-out decisions' };
-    }
-
-    if (!this.gameState.lastTrickOptOuts.includes(playerId)) {
-      this.gameState.lastTrickOptOuts.push(playerId);
-    }
-
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (this.gameState.lastTrickOptOuts.length === activePlayers.length - 1) {
-      // Only one player left, start last trick
-      this.gameState.gamePhase = 'playing';
-      return { success: true, message: 'Last trick decisions complete. Starting final trick.' };
-    }
-
-    return { success: true, message: `${player.username} opted out of the last trick.` };
-  }
-
-  endRound() {
-    // Apply final trick damage
-    if (this.gameState.trickHistory.length > 0) {
-      const finalTrick = this.gameState.trickHistory[this.gameState.trickHistory.length - 1];
-      const finalWinnerPlay = finalTrick.find(play => play.player === this.gameState.trickWinner);
-      
-      if (finalWinnerPlay) {
-        const winnerIndex = this.gameState.players.findIndex(p => p.username === finalWinnerPlay.player);
-        let damagePlayerIndex = (winnerIndex + 1) % this.gameState.players.length;
-        
-        // Skip eliminated players
-        while (this.gameState.players[damagePlayerIndex].isEliminated) {
-          damagePlayerIndex = (damagePlayerIndex + 1) % this.gameState.players.length;
-        }
-        
-        const damagePlayer = this.gameState.players[damagePlayerIndex];
-        const damage = this.calculateCardDamage(finalWinnerPlay.card);
-        
-        // Check if player opted out
-        if (this.gameState.lastTrickOptOuts.includes(damagePlayer._id)) {
-          // Find previous player who didn't opt out
-          let prevIndex = (winnerIndex - 1 + this.gameState.players.length) % this.gameState.players.length;
-          while (this.gameState.players[prevIndex].isEliminated || 
-                 this.gameState.lastTrickOptOuts.includes(this.gameState.players[prevIndex]._id)) {
-            prevIndex = (prevIndex - 1 + this.gameState.players.length) % this.gameState.players.length;
-          }
-          this.gameState.players[prevIndex].points += damage;
-        } else {
-          damagePlayer.points += damage;
-        }
-      }
-    }
-    
-    // Check for eliminations
-    this.gameState.players.forEach(player => {
-      if (player.points >= 12) {
-        player.isEliminated = true;
-      }
-    });
-    
-    const remainingPlayers = this.gameState.players.filter(p => !p.isEliminated);
-    
-    if (remainingPlayers.length <= 1) {
-      this.gameState.gamePhase = 'gameEnd';
-      this.gameState.status = 'ended';
-      this.gameState.roundWinner = remainingPlayers[0] || null;
-      return { 
-        success: true, 
-        message: `Game Over! Winner: ${this.gameState.roundWinner?.username || 'None'}`,
-        phase: 'gameEnd' 
-      };
-    } else {
-      // Start next round
-      this.gameState.round++;
-      this.gameState.tricksInRound = 0;
-      this.gameState.lastTrickOptOuts = [];
-      this.gameState.trickHistory = [];
-      this.nextDealer();
-      
-      // Clear all cards
-      this.gameState.players.forEach(p => p.cards = []);
-      
-      this.gameState.gamePhase = 'roundEnd';
-      
-      return { 
-        success: true, 
-        message: `Round ${this.gameState.round - 1} complete. Starting Round ${this.gameState.round}`,
-        phase: 'roundEnd',
-        eliminatedPlayers: this.gameState.players.filter(p => p.isEliminated)
-      };
-    }
-  }
-
-  calculateCardDamage(card) {
-    if (card.suit === '♠' && card.rank === '3') return 12; // Black 3
-    if (card.rank === '3') return 6; // Other 3s
-    if (card.rank === '4') return 4;
-    if (card.rank === 'A') return 2;
-    return 1; // All other cards
-  }
-
-  adjustPlayerPoints(requesterId, targetPlayerId, adjustment) {
-    const requester = this.gameState.players.find(p => p._id === requesterId);
-    const target = this.gameState.players.find(p => p._id === targetPlayerId);
-    
-    if (!requester || !target) {
-      return { success: false, error: 'Player not found' };
-    }
-    
-    target.points = Math.max(0, target.points + adjustment);
-    
-    // Check for elimination
-    if (target.points >= 12) {
-      target.isEliminated = true;
-    } else if (target.isEliminated && target.points < 12) {
-      target.isEliminated = false;
-    }
-    
-    return { 
-      success: true, 
-      message: `${target.username} points adjusted by ${adjustment} to ${target.points}` 
-    };
-  }
-
-  nextDealer() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    let nextDealerIndex = (this.gameState.dealerIndex + 1) % this.gameState.players.length;
-    
-    // Skip eliminated players
-    while (this.gameState.players[nextDealerIndex].isEliminated && activePlayers.length > 0) {
-      nextDealerIndex = (nextDealerIndex + 1) % this.gameState.players.length;
-    }
-    
-    this.gameState.dealerIndex = nextDealerIndex;
-    this.gameState.players.forEach((p, i) => {
-      p.isDealer = i === nextDealerIndex;
-    });
-    
-    this.gameState.currentPlayerIndex = (nextDealerIndex + 1) % this.gameState.players.length;
-    while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated && activePlayers.length > 0) {
-      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
-    }
-    
-    this.updateCurrentPlayer();
-  }
-
-  createStandardDeck() {
-    const suits = ['♠', '♥', '♦', '♣'];
-    const ranks = ['A', '10', '9', '8', '7', '6', '5', '4', '3'];
-    const deck = [];
-    let id = 1;
-    
-    suits.forEach(suit => {
-      ranks.forEach(rank => {
-        deck.push({ suit, rank, id: id++ });
-      });
-    });
-    
-    return deck;
-  }
-
-  shuffleDeck(deck) {
-    const d = [...deck];
-    for (let i = d.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [d[i], d[j]] = [d[j], d[i]];
-    }
-    return d;
-  }
-
-  updateCurrentPlayer() {
-    this.gameState.players.forEach((p, i) => {
-      p.isCurrent = i === this.gameState.currentPlayerIndex && !p.isEliminated;
-    });
-  }
-
-  nextPlayer() {
-    const activePlayers = this.gameState.players.filter(p => !p.isEliminated);
-    if (activePlayers.length === 0) return;
-    
-    do {
-      this.gameState.currentPlayerIndex = (this.gameState.currentPlayerIndex + 1) % this.gameState.players.length;
-    } while (this.gameState.players[this.gameState.currentPlayerIndex].isEliminated);
-    
-    this.updateCurrentPlayer();
+  } catch (error) {
+    console.error('AI move error:', error);
+  } finally {
+    aiQueue.delete(roomCode);
   }
 }
 
-module.exports = GameEngine;
+// Create room
+app.post('/api/create-room', async (req, res) => {
+  try {
+    const { playerName } = req.body;
+    if (!playerName || !playerName.trim()) {
+      return res.status(400).json({ success: false, error: 'Player name is required' });
+    }
+
+    const roomCode = generateRoomCode().toUpperCase();
+    const newRoom = new Room({ code: roomCode, maxPlayers: 6 });
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode, 
+      isDealer: false,
+      isAI: false,
+      avatar: '👤'
+    });
+
+    await player.save();
+    newRoom.players.push(player._id);
+    await newRoom.save();
+
+    gameEngines[roomCode] = new GameEngine(roomCode);
+    gameEngines[roomCode].updatePlayers([player]);
+
+    res.status(200).json({ success: true, roomCode, playerId: player._id.toString() });
+  } catch (error) {
+    console.error('Create room error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Join room
+app.post('/api/join-room', async (req, res) => {
+  try {
+    const { playerName, roomCode } = req.body;
+    if (!playerName || !roomCode) {
+      return res.status(400).json({ success: false, error: 'Player name and room code are required' });
+    }
+
+    const room = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
+    if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+    if (room.players.length >= 6) return res.status(400).json({ success: false, error: 'Room is full' });
+
+    const existing = room.players.find(p => p.username === playerName.trim());
+    if (existing) return res.status(400).json({ success: false, error: 'Player name taken' });
+
+    const player = new Player({ 
+      username: playerName.trim(), 
+      roomCode: roomCode.toUpperCase(), 
+      isAI: false,
+      avatar: '👤'
+    });
+    await player.save();
+    room.players.push(player._id);
+    await room.save();
+
+    const gameEngine = gameEngines[roomCode.toUpperCase()] || new GameEngine(roomCode.toUpperCase());
+    if (!gameEngines[roomCode.toUpperCase()]) gameEngines[roomCode.toUpperCase()] = gameEngine;
+
+    const updatedRoom = await Room.findOne({ code: roomCode.toUpperCase() }).populate('players');
+    gameEngine.updatePlayers(updatedRoom.players);
+
+    io.to(roomCode.toUpperCase()).emit('game-state', gameEngine.getGameState());
+
+    res.status(200).json({ success: true, roomCode: roomCode.toUpperCase(), playerId: player._id.toString() });
+  } catch (error) {
+    console.error('Join room error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Socket.IO
+io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+
+  socket.on('join-game', async ({ playerId, roomCode }) => {
+    try {
+      const player = await Player.findById(playerId);
+      const room = await Room.findOne({ code: roomCode }).populate('players');
+      if (!player || !room) return socket.emit('error', { message: 'Invalid player or room' });
+
+      player.socketId = socket.id;
+      await player.save();
+      socket.join(roomCode);
+
+      const gameEngine = gameEngines[roomCode];
+      if (gameEngine) {
+        const updatedRoom = await Room.findOne({ code: roomCode }).populate('players');
+        gameEngine.updatePlayers(updatedRoom.players);
+        
+        // Trigger AI move if current player is AI
+        if (gameEngine.isCurrentPlayerAI() && gameEngine.gameState.gamePhase === 'playing') {
+          setTimeout(() => processAIMove(roomCode, gameEngine), 1000);
+        }
+      }
+
+      socket.emit('game-state', gameEngine?.getGameState());
+    } catch (error) {
+      console.error('Join game error:', error);
+      socket.emit('error', { message: 'Failed to join game' });
+    }
+  });
+
+  socket.on('manage-ai', async ({ action, aiKey }) => {
+    try {
+      const player = await Player.findOne({ socketId: socket.id });
+      if (!player) return socket.emit('error', { message: 'Player not found' });
+
+      const room = await Room.findOne({ code: player.roomCode }).populate('players');
+      const gameEngine = gameEngines[room.code];
+
+      if (!gameEngine || !room) return socket.emit('error', { message: 'Game not found' });
+
+      const config = AI_PLAYERS[aiKey];
+      if (!config) return socket.emit('error', { message: 'Invalid AI player' });
+
+      let result;
+      if (action === 'add') {
+        if (room.players.length >= 6) {
+          return socket.emit('error', { message: 'Room is full' });
+        }
+
+        const existsInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (existsInDB) {
+          return socket.emit('error', { message: 'AI already in room' });
+        }
+
+        result = gameEngine.addAIPlayer(aiKey);
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
+
+        const aiPlayer = new Player({
+          username: config.name,
+          roomCode: room.code,
+          isAI: true,
+          aiLevel: config.level,
+          avatar: config.avatar,
+          socketId: 'AI_PLAYER'
+        });
+        await aiPlayer.save();
+        room.players.push(aiPlayer._id);
+        await room.save();
+
+      } else if (action === 'remove') {
+        const aiPlayerInDB = room.players.find(p => p.username === config.name && p.isAI);
+        if (!aiPlayerInDB) {
+          return socket.emit('error', { message: 'AI not found in database' });
+        }
+
+        result = gameEngine.removeAIPlayer(aiKey);
+        if (!result.success) {
+          return socket.emit('error', { message: result.error });
+        }
+
+        await Player.findByIdAndDelete(aiPlayerInDB._id);
+        room.players = room.players.filter(p => p._id.toString() !== aiPlayerInDB._id.toString());
+        await room.save();
+      } else {
+        return socket.emit('error', { message: 'Invalid action' });
+      }
+
+      const updatedRoom = await Room.findOne({ code: room.code }).populate('players');
+      gameEngine.updatePlayers(updatedRoom.players);
+      
+      io.to(room.code).emit('game-state', gameEngine.getGameState());
+      io.to(room.code).emit('game-message', { message: result.message });
+
+    } catch (error) {
+      console.error('Error managing AI:', error);
+      socket.emit('error', { message: 'Failed to manage AI' });
+    }
+  });
+
+  socket.on('game-action', async ({ action, cardId, data }) => {
+    try {
+      const player = await Player.findOne({ socketId: socket.id });
+      if (!player) return socket.emit('error', { message: 'Player not found' });
+
+      const gameEngine = gameEngines[player.roomCode];
+      if (!gameEngine) return socket.emit('error', { message: 'Game not found' });
+
+      let result;
+      if (action === 'startGame') {
+        result = gameEngine.handleAction(action, player._id.toString(), cardId, data || {});
+      } else if (action === 'playCard') {
+        result = gameEngine.handleAction(action, player._id.toString(), cardId);
+      } else if (action === 'adjustPoints') {
+        result = gameEngine.handleAction(action, player._id.toString(), cardId, data);
+      } else if (action === 'optOutLastTrick') {
+        result = gameEngine.handleAction(action, player._id.toString());
+      } else if (action === 'continueToNextRound') {
+        // Deal cards for next round
+        result = gameEngine.dealCards();
+      } else {
+        return socket.emit('error', { message: 'Unknown action' });
+      }
+
+      if (result.success) {
+        await Room.findOneAndUpdate(
+          { code: player.roomCode },
+          { gameState: gameEngine.getGameState() },
+          { new: true }
+        );
+
+        io.to(player.roomCode).emit('game-state', gameEngine.getGameState());
+        
+        if (result.message) {
+          io.to(player.roomCode).emit('game-message', { message: result.message });
+        }
+
+        if (result.dealerInfo) {
+          io.to(player.roomCode).emit('dealer-selected', result.dealerInfo);
+        }
+
+        // Process AI move if needed
+        if (result.needsAIMove) {
+          setTimeout(() => processAIMove(player.roomCode, gameEngine), 1000);
+        }
+      } else {
+        socket.emit('error', { message: result.error });
+      }
+    } catch (error) {
+      console.error('Game action error:', error);
+      socket.emit('error', { message: 'Game action failed' });
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    console.log('Player disconnected:', socket.id);
+    try {
+      const player = await Player.findOne({ socketId: socket.id });
+      if (player) {
+        player.isActive = false;
+        await player.save();
+      }
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
+  });
+});
+
+function generateRoomCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  for (let i = 0; i < 4; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
